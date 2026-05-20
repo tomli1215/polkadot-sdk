@@ -235,11 +235,19 @@ impl<H: ExHashT> TransactionsHandlerController<H> {
 	pub fn propagate_transaction(&self, hash: H) {
 		let _ = self.to_handler.unbounded_send(ToHandler::PropagateTransaction(hash));
 	}
+
+	/// Propagate a single SCALE-encoded extrinsic to one connected peer (fast-prop path).
+	pub fn propagate_extrinsic_to_peer(&self, extrinsic: Vec<u8>, peer_id: PeerId) {
+		let _ = self
+			.to_handler
+			.unbounded_send(ToHandler::PropagateExtrinsicToPeer { extrinsic, peer_id });
+	}
 }
 
 enum ToHandler<H: ExHashT> {
 	PropagateTransactions,
 	PropagateTransaction(H),
+	PropagateExtrinsicToPeer { extrinsic: Vec<u8>, peer_id: PeerId },
 }
 
 /// Handler for transactions. Call [`TransactionsHandler::run`] to start the processing.
@@ -317,6 +325,8 @@ where
 					match message {
 						ToHandler::PropagateTransaction(hash) => self.propagate_transaction(&hash),
 						ToHandler::PropagateTransactions => self.propagate_transactions(),
+						ToHandler::PropagateExtrinsicToPeer { extrinsic, peer_id } =>
+							self.propagate_extrinsic_to_peer(extrinsic, peer_id),
 					}
 				},
 				event = self.notification_service.next_event().fuse() => {
@@ -449,6 +459,34 @@ where
 			TransactionImport::Bad => self.network.report_peer(who, rep::BAD_TRANSACTION),
 			TransactionImport::None => {},
 		}
+	}
+
+	/// Propagate one SCALE-encoded extrinsic to a single peer (RFC-56 one-tx notification).
+	pub fn propagate_extrinsic_to_peer(&mut self, extrinsic: Vec<u8>, peer_id: PeerId) {
+		if self.sync.is_major_syncing() {
+			return;
+		}
+
+		let Some(peer) = self.peers.get_mut(&peer_id) else {
+			debug!(
+				target: LOG_TARGET,
+				"fast prop: peer {peer_id} not connected for extrinsic propagation"
+			);
+			return;
+		};
+
+		if matches!(peer.role, ObservedRole::Light) {
+			return;
+		}
+
+		debug!(
+			target: LOG_TARGET,
+			"Propagating extrinsic ({} bytes) to {peer_id}",
+			extrinsic.len()
+		);
+		let _ = self
+			.notification_service
+			.send_sync_notification(&peer_id, vec![extrinsic].encode());
 	}
 
 	/// Propagate one transaction.
