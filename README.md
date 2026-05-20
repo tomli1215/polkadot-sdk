@@ -17,6 +17,25 @@ forks](https://img.shields.io/github/forks/paritytech/polkadot-sdk)
 
 </div>
 
+## Custom fork (`mev/block-announce`)
+
+Fork: [tomli1215/polkadot-sdk](https://github.com/tomli1215/polkadot-sdk) (from [opentensor/polkadot-sdk](https://github.com/opentensor/polkadot-sdk)).
+
+**Base commit:** `7cc54bf2d50ae3921d718736dfeb0de9468539c7` (OpenTensor Subtensor pin). Branch **`mev/block-announce`** adds block-announce support in `sc-network-sync`:
+
+- `block_announce_notify` — in-process broadcast for RPC subscribers (no `block_announces.log` / file logging)
+- `engine.rs` calls `publish_block_announce_received` when a `/block-announces/1` message is decoded
+
+**Current tip for Subtensor:** `bc5a0c573aa154ea373b327953723d185a34ecbf` — set this as `rev` in [tomli1215/subtensor](https://github.com/tomli1215/subtensor) `Cargo.toml` after pushing this branch.
+
+```sh
+git checkout 7cc54bf2d50ae3921d718736dfeb0de9468539c7   # if cloning fresh; fetch from opentensor if missing
+# apply changes, commit, then:
+git push origin mev/block-announce
+```
+
+---
+
 ## ⚡ Quickstart
 If you want to get an example node running quickly you can execute the following getting started script:
 
