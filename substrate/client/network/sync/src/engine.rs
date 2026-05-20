@@ -33,7 +33,7 @@ use crate::{
 	BLOCK_ANNOUNCE_LOG, LOG_TARGET,
 };
 
-use crate::block_announce_file_log::log_block_announce_received;
+use crate::block_announce_notify::publish_block_announce_received;
 
 use codec::{Decode, DecodeAll, Encode};
 use futures::{channel::oneshot, StreamExt};
@@ -797,7 +797,7 @@ where
 				let is_best = matches!(announce.state, None | Some(BlockState::Best));
 				let have_block = self.client_has_block(hash);
 				let data_len = announce.data.as_ref().map(|d| d.len()).unwrap_or(0);
-				log_block_announce_received(
+				publish_block_announce_received(
 					&peer,
 					number,
 					format!("{hash:?}"),

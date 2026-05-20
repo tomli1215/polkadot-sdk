@@ -24,7 +24,6 @@ pub use strategy::warp::{WarpSyncConfig, WarpSyncPhase, WarpSyncProgress};
 pub use types::{SyncEvent, SyncEventStream, SyncState, SyncStatus, SyncStatusProvider};
 
 pub mod block_announce_notify;
-mod block_announce_file_log;
 mod block_announce_validator;
 mod futures_stream;
 mod justification_requests;
