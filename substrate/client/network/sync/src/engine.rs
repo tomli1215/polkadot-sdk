@@ -30,12 +30,14 @@ use crate::{
 	},
 	strategy::{SyncingAction, SyncingStrategy},
 	types::{BadPeer, ExtendedPeerInfo, SyncEvent},
-	LOG_TARGET,
+	BLOCK_ANNOUNCE_LOG, LOG_TARGET,
 };
+
+use crate::block_announce_file_log::log_block_announce_received;
 
 use codec::{Decode, DecodeAll, Encode};
 use futures::{channel::oneshot, StreamExt};
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use prometheus_endpoint::{
 	register, Counter, Gauge, MetricSource, Opts, PrometheusError, Registry, SourcedGauge, U64,
 };
@@ -63,9 +65,9 @@ use sc_network_common::{
 use sc_network_types::PeerId;
 use sc_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver, TracingUnboundedSender};
 use sp_blockchain::{Error as ClientError, HeaderMetadata};
-use sp_consensus::{block_validation::BlockAnnounceValidator, BlockOrigin};
+use sp_consensus::{block_validation::BlockAnnounceValidator, BlockOrigin, BlockStatus};
 use sp_runtime::{
-	traits::{Block as BlockT, Header, NumberFor, Zero},
+	traits::{Block as BlockT, Header, NumberFor, UniqueSaturatedInto, Zero},
 	Justifications,
 };
 
@@ -424,6 +426,13 @@ where
 		}
 	}
 
+	fn client_has_block(&self, hash: B::Hash) -> bool {
+		self.client
+			.block_status(hash)
+			.ok()
+			.is_some_and(|s| matches!(s, BlockStatus::InChainWithState | BlockStatus::InChainPruned))
+	}
+
 	/// Process the result of the block announce validation.
 	fn process_block_announce_validation_result(
 		&mut self,
@@ -432,6 +441,15 @@ where
 		match validation_result {
 			BlockAnnounceValidationResult::Skip { peer_id: _ } => {},
 			BlockAnnounceValidationResult::Process { is_new_best, peer_id, announce } => {
+				let hash = announce.header.hash();
+				let number = *announce.header.number();
+				let have_block = self.client_has_block(hash);
+				trace!(
+					target: BLOCK_ANNOUNCE_LOG,
+					"announce validated peer={peer_id} #{number} hash={hash:?} \
+					is_new_best={is_new_best} local_have_block={have_block}"
+				);
+
 				if let Some((best_hash, best_number)) =
 					self.strategy.on_validated_block_announce(is_new_best, peer_id, &announce)
 				{
@@ -767,10 +785,26 @@ where
 					return;
 				}
 
-				let Ok(announce) = BlockAnnounce::decode(&mut notification.as_ref()) else {
+				let Ok(announce): Result<BlockAnnounce<B::Header>, _> =
+					BlockAnnounce::decode(&mut notification.as_ref())
+				else {
 					log::warn!(target: LOG_TARGET, "failed to decode block announce");
 					return;
 				};
+
+				let hash = announce.header.hash();
+				let number = (*announce.header.number()).unique_saturated_into();
+				let is_best = matches!(announce.state, None | Some(BlockState::Best));
+				let have_block = self.client_has_block(hash);
+				let data_len = announce.data.as_ref().map(|d| d.len()).unwrap_or(0);
+				log_block_announce_received(
+					&peer,
+					number,
+					format!("{hash:?}"),
+					is_best,
+					have_block,
+					data_len,
+				);
 
 				self.push_block_announce_validation(peer, announce);
 			},
