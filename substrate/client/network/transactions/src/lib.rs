@@ -56,7 +56,7 @@ use std::{
 	iter,
 	num::NonZeroUsize,
 	pin::Pin,
-	sync::Arc,
+	sync::{Arc, OnceLock, RwLock},
 	task::Poll,
 };
 
@@ -219,7 +219,35 @@ pub struct TransactionsHandlerController<H: ExHashT> {
 	to_handler: TracingUnboundedSender<ToHandler<H>>,
 }
 
+type FastPropPropagator = dyn Fn(Vec<u8>, PeerId) + Send + Sync;
+
+static FAST_PROP_PROPAGATOR: OnceLock<RwLock<Option<Arc<FastPropPropagator>>>> = OnceLock::new();
+
+fn fast_prop_propagator_slot() -> &'static RwLock<Option<Arc<FastPropPropagator>>> {
+	FAST_PROP_PROPAGATOR.get_or_init(|| RwLock::new(None))
+}
+
+/// Register P2P propagation for the fast-prop pool (node calls once at startup).
+pub fn register_fast_prop_propagator(propagator: Arc<FastPropPropagator>) {
+	*fast_prop_propagator_slot().write().expect("fast prop propagator lock") = Some(propagator);
+}
+
+/// Propagate a SCALE-encoded extrinsic to one peer (used from fast-prop fire handler).
+pub fn fast_prop_propagate_extrinsic(extrinsic: Vec<u8>, peer_id: PeerId) {
+	match fast_prop_propagator_slot().read().expect("fast prop propagator lock").as_ref() {
+		Some(propagate) => propagate(extrinsic, peer_id),
+		None => log::warn!(
+			target: LOG_TARGET,
+			"fast_prop_propagate_extrinsic: no propagator registered"
+		),
+	}
+}
+
 impl<H: ExHashT> TransactionsHandlerController<H> {
+	/// Second handle to the same background transaction handler (fast-prop path).
+	pub fn sender_clone(&self) -> Self {
+		Self { to_handler: self.to_handler.clone() }
+	}
 	/// You may call this when new transactions are imported by the transaction pool.
 	///
 	/// All transactions will be fetched from the `TransactionPool` that was passed at
