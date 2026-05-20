@@ -11,7 +11,12 @@ use std::sync::{OnceLock, RwLock};
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FastPropFiredNotification {
+	/// RFC3339 UTC when fast-prop fired (immediately before P2P propagate).
 	pub utc: String,
+	/// RFC3339 UTC when the triggering best block announce was received.
+	pub announce_utc: String,
+	/// Milliseconds from best block announce to fire.
+	pub latency_ms: i64,
 	pub event: &'static str,
 	pub peer_id: String,
 	#[serde(rename = "number")]
@@ -54,9 +59,16 @@ pub fn publish_fast_prop_fired(
 	block_number: u64,
 	block_hash: &str,
 	extrinsic: &[u8],
+	fire_utc: &str,
+	announce_utc: &str,
+	announce_unix_ms: i64,
 ) {
+	let fire_time = Utc::now();
+	let latency_ms = fire_time.timestamp_millis().saturating_sub(announce_unix_ms);
 	let notification = FastPropFiredNotification {
-		utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+		utc: fire_utc.to_string(),
+		announce_utc: announce_utc.to_string(),
+		latency_ms,
 		event: "fast_prop_fired",
 		peer_id: peer_id.to_string(),
 		block_number,

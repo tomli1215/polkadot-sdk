@@ -20169,6 +20169,7 @@ dependencies = [
  "array-bytes 6.2.2",
  "async-channel 1.9.0",
  "async-trait",
+ "chrono",
  "fork-tree",
  "futures",
  "log",
@@ -20185,6 +20186,7 @@ dependencies = [
  "sc-network-types",
  "sc-utils",
  "schnellru",
+ "serde",
  "smallvec",
  "sp-arithmetic 27.0.0",
  "sp-blockchain",
@@ -20238,6 +20240,7 @@ name = "sc-network-transactions"
 version = "0.50.0"
 dependencies = [
  "array-bytes 6.2.2",
+ "async-trait",
  "futures",
  "log",
  "parity-scale-codec",

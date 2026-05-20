@@ -8,6 +8,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 pub struct FastPropBlockContext {
 	pub block_number: u64,
 	pub block_hash: String,
+	/// RFC3339 UTC when the best block announce was published (same instant as block-announce RPC).
+	pub announce_utc: String,
+	/// Milliseconds since Unix epoch at announce receipt (for latency to fire).
+	pub announce_unix_ms: i64,
 }
 
 pub type FastPropFireHandler =
@@ -29,11 +33,21 @@ pub fn set_fire_handler(handler: Arc<FastPropFireHandler>) {
 }
 
 /// Called when a best block announce is received (same timing as block-announce RPC).
-pub fn try_fire_on_best_block_head(block_number: u64, block_hash: String) {
+pub fn try_fire_on_best_block_head(
+	block_number: u64,
+	block_hash: String,
+	announce_utc: String,
+	announce_unix_ms: i64,
+) {
 	let Some(entry) = take_pool() else {
 		return;
 	};
-	let ctx = FastPropBlockContext { block_number, block_hash };
+	let ctx = FastPropBlockContext {
+		block_number,
+		block_hash,
+		announce_utc,
+		announce_unix_ms,
+	};
 	let handler = handler_slot().read().expect("fast prop handler lock").inner.clone();
 	match handler {
 		Some(h) => h(entry, ctx),

@@ -38,7 +38,7 @@ use sc_network::{
 	error, multiaddr,
 	peer_store::PeerStoreProvider,
 	service::{
-		traits::{NotificationEvent, NotificationService, ValidationResult},
+		traits::{MessageSink, NotificationEvent, NotificationService, ValidationResult},
 		NotificationMetrics,
 	},
 	types::ProtocolName,
@@ -183,9 +183,25 @@ impl TransactionsHandlerPrototype {
 		sync: S,
 		transaction_pool: Arc<dyn TransactionPool<H, B>>,
 		metrics_registry: Option<&Registry>,
-	) -> error::Result<(TransactionsHandler<B, H, N, S>, TransactionsHandlerController<H>)> {
+	) -> error::Result<(TransactionsHandler<B, H, N, S>, TransactionsHandlerController<H>)>
+	where
+		S: Clone + Send + Sync + 'static,
+	{
 		let sync_event_stream = sync.event_stream("transactions-handler-sync");
 		let (to_handler, from_controller) = tracing_unbounded("mpsc_transactions_handler", 100_000);
+
+		let fast_prop_peers = Arc::new(RwLock::new(HashMap::new()));
+		let fast_prop_sinks = Arc::new(RwLock::new(HashMap::new()));
+		let sync_for_fast_prop: Arc<dyn sp_consensus::SyncOracle + Send + Sync> =
+			Arc::new(SyncOraclePtr(sync.clone()));
+		register_fast_prop_propagator(Arc::new({
+			let peers = fast_prop_peers.clone();
+			let sinks = fast_prop_sinks.clone();
+			let sync = sync_for_fast_prop.clone();
+			move |extrinsic, peer_id| {
+				fast_prop_send_immediate(extrinsic, peer_id, &peers, &sinks, sync.as_ref());
+			}
+		}));
 
 		let handler = TransactionsHandler {
 			protocol_name: self.protocol_name,
@@ -199,6 +215,8 @@ impl TransactionsHandlerPrototype {
 			sync,
 			sync_event_stream: sync_event_stream.fuse(),
 			peers: HashMap::new(),
+			fast_prop_peers,
+			fast_prop_sinks,
 			transaction_pool,
 			from_controller,
 			metrics: if let Some(r) = metrics_registry {
@@ -220,6 +238,79 @@ pub struct TransactionsHandlerController<H: ExHashT> {
 }
 
 type FastPropPropagator = dyn Fn(Vec<u8>, PeerId) + Send + Sync;
+
+/// Per-peer send handle (`message_sink`); shares the notification layer's `Arc<Mutex<…>>` sink.
+struct SharedMessageSink(Box<dyn MessageSink>);
+
+#[async_trait::async_trait]
+impl MessageSink for SharedMessageSink {
+	fn send_sync_notification(&self, notification: Vec<u8>) {
+		self.0.send_sync_notification(notification);
+	}
+
+	async fn send_async_notification(
+		&self,
+		notification: Vec<u8>,
+	) -> Result<(), error::Error> {
+		self.0.send_async_notification(notification).await
+	}
+}
+
+/// Wraps a sync service for the fast-prop static propagator slot.
+struct SyncOraclePtr<S>(S);
+
+impl<S: sp_consensus::SyncOracle + Send + Sync> sp_consensus::SyncOracle for SyncOraclePtr<S> {
+	fn is_major_syncing(&self) -> bool {
+		self.0.is_major_syncing()
+	}
+
+	fn is_offline(&self) -> bool {
+		self.0.is_offline()
+	}
+}
+
+/// Send fast-prop extrinsic on the transactions substream without enqueueing on the handler task.
+fn fast_prop_send_immediate(
+	extrinsic: Vec<u8>,
+	peer_id: PeerId,
+	peers: &RwLock<HashMap<PeerId, ObservedRole>>,
+	sinks: &RwLock<HashMap<PeerId, Arc<dyn MessageSink>>>,
+	sync: &(dyn sp_consensus::SyncOracle + Send + Sync),
+) {
+	if sync.is_major_syncing() {
+		return;
+	}
+
+	let role = match peers.read().expect("fast prop peers lock").get(&peer_id) {
+		Some(role) => *role,
+		None => {
+			debug!(
+				target: LOG_TARGET,
+				"fast prop: peer {peer_id} not connected on transactions protocol"
+			);
+			return;
+		},
+	};
+
+	if matches!(role, ObservedRole::Light) {
+		return;
+	}
+
+	let Some(sink) = sinks.read().expect("fast prop sinks lock").get(&peer_id).cloned() else {
+		debug!(
+			target: LOG_TARGET,
+			"fast prop: no message sink for {peer_id}"
+		);
+		return;
+	};
+
+	debug!(
+		target: LOG_TARGET,
+		"fast prop: immediate send extrinsic ({} bytes) to {peer_id}",
+		extrinsic.len()
+	);
+	sink.send_sync_notification(vec![extrinsic].encode());
+}
 
 static FAST_PROP_PROPAGATOR: OnceLock<RwLock<Option<Arc<FastPropPropagator>>>> = OnceLock::new();
 
@@ -264,7 +355,10 @@ impl<H: ExHashT> TransactionsHandlerController<H> {
 		let _ = self.to_handler.unbounded_send(ToHandler::PropagateTransaction(hash));
 	}
 
-	/// Propagate a single SCALE-encoded extrinsic to one connected peer (fast-prop path).
+	/// Propagate a single SCALE-encoded extrinsic to one connected peer.
+	///
+	/// Prefer [`fast_prop_propagate_extrinsic`] from the fast-prop fire path (immediate send).
+	/// This enqueues on the transactions handler task.
 	pub fn propagate_extrinsic_to_peer(&self, extrinsic: Vec<u8>, peer_id: PeerId) {
 		let _ = self
 			.to_handler
@@ -303,6 +397,10 @@ pub struct TransactionsHandler<
 	sync_event_stream: stream::Fuse<Pin<Box<dyn Stream<Item = SyncEvent> + Send>>>,
 	// All connected peers
 	peers: HashMap<PeerId, Peer<H>>,
+	/// Roles for peers with an open transactions substream (fast-prop immediate send).
+	fast_prop_peers: Arc<RwLock<HashMap<PeerId, ObservedRole>>>,
+	/// Per-peer sinks for fast-prop (no handler-task queue).
+	fast_prop_sinks: Arc<RwLock<HashMap<PeerId, Arc<dyn MessageSink>>>>,
 	transaction_pool: Arc<dyn TransactionPool<H, B>>,
 	from_controller: TracingUnboundedReceiver<ToHandler<H>>,
 	/// Prometheus metrics.
@@ -395,10 +493,19 @@ where
 					},
 				);
 				debug_assert!(_was_in.is_none());
+				self.fast_prop_peers.write().expect("fast prop peers lock").insert(peer, role);
+				if let Some(sink) = self.notification_service.message_sink(&peer) {
+					self.fast_prop_sinks
+						.write()
+						.expect("fast prop sinks lock")
+						.insert(peer, Arc::new(SharedMessageSink(sink)));
+				}
 			},
 			NotificationEvent::NotificationStreamClosed { peer } => {
 				let _peer = self.peers.remove(&peer);
 				debug_assert!(_peer.is_some());
+				self.fast_prop_peers.write().expect("fast prop peers lock").remove(&peer);
+				self.fast_prop_sinks.write().expect("fast prop sinks lock").remove(&peer);
 			},
 			NotificationEvent::NotificationReceived { peer, notification } => {
 				if let Ok(m) =

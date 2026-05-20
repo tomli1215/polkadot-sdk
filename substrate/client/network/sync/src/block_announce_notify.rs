@@ -1,6 +1,5 @@
 //! In-process broadcast of `/block-announces/1` receipts for RPC subscribers.
 
-use chrono::{SecondsFormat, Utc};
 use futures::channel::mpsc;
 use futures::Stream;
 use sc_network_types::PeerId;
@@ -56,9 +55,10 @@ pub fn publish_block_announce_received(
 	is_best: bool,
 	local_have_block: bool,
 	announce_data_bytes: usize,
+	announce_utc: &str,
 ) {
 	let notification = BlockAnnounceNotification {
-		utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+		utc: announce_utc.to_string(),
 		event: "block_announce_received",
 		peer: peer_id.to_string(),
 		block_number: number,

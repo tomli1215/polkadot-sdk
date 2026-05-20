@@ -36,6 +36,7 @@ use crate::{
 use crate::block_announce_notify::publish_block_announce_received;
 use crate::fast_prop::try_fire_on_best_block_head;
 
+use chrono::{SecondsFormat, Utc};
 use codec::{Decode, DecodeAll, Encode};
 use futures::{channel::oneshot, StreamExt};
 use log::{debug, error, info, trace, warn};
@@ -799,6 +800,9 @@ where
 				let have_block = self.client_has_block(hash);
 				let data_len = announce.data.as_ref().map(|d| d.len()).unwrap_or(0);
 				let block_hash_str = format!("{hash:?}");
+				let announce_time = Utc::now();
+				let announce_utc = announce_time.to_rfc3339_opts(SecondsFormat::Millis, true);
+				let announce_unix_ms = announce_time.timestamp_millis();
 				publish_block_announce_received(
 					&peer,
 					number,
@@ -806,9 +810,15 @@ where
 					is_best,
 					have_block,
 					data_len,
+					&announce_utc,
 				);
 				if is_best {
-					try_fire_on_best_block_head(number, block_hash_str);
+					try_fire_on_best_block_head(
+						number,
+						block_hash_str,
+						announce_utc,
+						announce_unix_ms,
+					);
 				}
 
 				self.push_block_announce_validation(peer, announce);
