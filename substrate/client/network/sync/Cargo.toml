@@ -41,6 +41,7 @@ sc-network-types.default-features = true
 sc-network-types.workspace = true
 sc-utils.default-features = true
 sc-utils.workspace = true
+serde = { features = ["derive"], workspace = true, default-features = true }
 schnellru = { workspace = true }
 smallvec = { workspace = true, default-features = true }
 sp-arithmetic.default-features = true
