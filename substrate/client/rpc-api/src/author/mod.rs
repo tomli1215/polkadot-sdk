@@ -59,6 +59,14 @@ pub trait AuthorApi<Hash, BlockHash> {
 	#[method(name = "author_pendingExtrinsics")]
 	fn pending_extrinsics(&self) -> Result<Vec<Bytes>, Error>;
 
+	/// Returns all extrinsics in the transaction pool future queue.
+	///
+	/// These transactions are not yet ready for inclusion (e.g. waiting on nonce or other
+	/// dependency tags). With the fork-aware pool, this reflects the future set of the most
+	/// recently maintained best block view (same scope as [`Self::pending_extrinsics`]).
+	#[method(name = "author_futureExtrinsics")]
+	fn future_extrinsics(&self) -> Result<Vec<Bytes>, Error>;
+
 	/// Remove given extrinsic from the pool and temporarily ban it to prevent reimporting.
 	#[method(name = "author_removeExtrinsic", with_extensions)]
 	fn remove_extrinsic(

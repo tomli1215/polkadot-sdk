@@ -184,6 +184,29 @@ async fn author_should_return_pending_extrinsics() {
 }
 
 #[tokio::test]
+async fn author_should_return_future_extrinsics() {
+	let api = TestSetup::into_rpc();
+
+	let xt0_bytes: Bytes = uxt(Sr25519Keyring::Alice, 0).encode().into();
+	api.call::<_, H256>("author_submitExtrinsic", [to_hex(&xt0_bytes, true)])
+		.await
+		.unwrap();
+
+	let xt1_bytes: Bytes = uxt(Sr25519Keyring::Alice, 1).encode().into();
+	api.call::<_, H256>("author_submitExtrinsic", [to_hex(&xt1_bytes, true)])
+		.await
+		.unwrap();
+
+	let pending: Vec<Bytes> =
+		api.call("author_pendingExtrinsics", EmptyParams::new()).await.unwrap();
+	assert_eq!(pending, vec![xt0_bytes.clone()]);
+
+	let future: Vec<Bytes> =
+		api.call("author_futureExtrinsics", EmptyParams::new()).await.unwrap();
+	assert_eq!(future, vec![xt1_bytes]);
+}
+
+#[tokio::test]
 async fn author_should_remove_extrinsics() {
 	const METHOD: &'static str = "author_removeExtrinsic";
 	let setup = TestSetup::default();

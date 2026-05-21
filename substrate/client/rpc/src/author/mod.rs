@@ -153,6 +153,10 @@ where
 		Ok(self.pool.ready().map(|tx| tx.data().encode().into()).collect())
 	}
 
+	fn future_extrinsics(&self) -> Result<Vec<Bytes>> {
+		Ok(self.pool.futures().iter().map(|tx| tx.data().encode().into()).collect())
+	}
+
 	fn remove_extrinsic(
 		&self,
 		ext: &Extensions,
