@@ -10,6 +10,9 @@ pub struct FastPropEntry {
 	pub extrinsic: Vec<u8>,
 	/// libp2p peer id string (e.g. `12D3KooW…`).
 	pub peer_id: String,
+	/// Milliseconds to wait after a best block announce before firing (0 = immediate).
+	#[serde(default)]
+	pub offset_ms: u64,
 }
 
 /// Snapshot returned by RPC `get` (entry may be present without consuming the pool).
@@ -21,6 +24,8 @@ pub struct FastPropPoolView {
 	pub extrinsic: Option<Vec<u8>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub peer_id: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub offset_ms: Option<u64>,
 }
 
 static POOL: OnceLock<RwLock<Option<FastPropEntry>>> = OnceLock::new();
@@ -43,11 +48,17 @@ pub fn set_pool(entry: FastPropEntry) -> Result<(), &'static str> {
 pub fn get_pool() -> FastPropPoolView {
 	let guard = pool().read().expect("fast prop pool lock");
 	match guard.as_ref() {
-		None => FastPropPoolView { occupied: false, extrinsic: None, peer_id: None },
+		None => FastPropPoolView {
+			occupied: false,
+			extrinsic: None,
+			peer_id: None,
+			offset_ms: None,
+		},
 		Some(entry) => FastPropPoolView {
 			occupied: true,
 			extrinsic: Some(entry.extrinsic.clone()),
 			peer_id: Some(entry.peer_id.clone()),
+			offset_ms: Some(entry.offset_ms),
 		},
 	}
 }

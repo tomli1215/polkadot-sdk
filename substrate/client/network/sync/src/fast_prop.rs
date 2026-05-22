@@ -1,7 +1,8 @@
-//! Fast propagation: fire pooled `(extrinsic, peer_id)` on best block-head signals.
+//! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms)` on best block-head signals.
 
 use crate::fast_prop_pool::{take_pool, FastPropEntry};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 /// Context for the block-head signal that triggered a fast-prop fire.
 #[derive(Clone, Debug)]
@@ -32,6 +33,10 @@ pub fn set_fire_handler(handler: Arc<FastPropFireHandler>) {
 	handler_slot().write().expect("fast prop handler lock").inner = Some(handler);
 }
 
+fn invoke_handler(handler: Arc<FastPropFireHandler>, entry: FastPropEntry, ctx: FastPropBlockContext) {
+	handler(entry, ctx);
+}
+
 /// Called when a best block announce is received (same timing as block-announce RPC).
 pub fn try_fire_on_best_block_head(
 	block_number: u64,
@@ -49,13 +54,28 @@ pub fn try_fire_on_best_block_head(
 		announce_unix_ms,
 	};
 	let handler = handler_slot().read().expect("fast prop handler lock").inner.clone();
-	match handler {
-		Some(h) => h(entry, ctx),
-		None => {
-			log::warn!(
-				target: crate::LOG_TARGET,
-				"fast prop pool entry dropped: no fire handler registered"
-			);
-		},
+	let Some(handler) = handler else {
+		log::warn!(
+			target: crate::LOG_TARGET,
+			"fast prop pool entry dropped: no fire handler registered"
+		);
+		return;
+	};
+
+	if entry.offset_ms == 0 {
+		invoke_handler(handler, entry, ctx);
+		return;
 	}
+
+	let offset_ms = entry.offset_ms;
+	log::debug!(
+		target: crate::LOG_TARGET,
+		"fast prop: scheduling fire {}ms after block #{} announce",
+		offset_ms,
+		ctx.block_number,
+	);
+	tokio::spawn(async move {
+		tokio::time::sleep(Duration::from_millis(offset_ms)).await;
+		invoke_handler(handler, entry, ctx);
+	});
 }

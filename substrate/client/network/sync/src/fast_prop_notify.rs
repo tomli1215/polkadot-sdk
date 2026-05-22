@@ -15,7 +15,9 @@ pub struct FastPropFiredNotification {
 	pub utc: String,
 	/// RFC3339 UTC when the triggering best block announce was received.
 	pub announce_utc: String,
-	/// Milliseconds from best block announce to fire.
+	/// Configured delay from announce to fire (`FastPropEntry::offset_ms`).
+	pub offset_ms: u64,
+	/// Milliseconds from best block announce to fire (actual).
 	pub latency_ms: i64,
 	pub event: &'static str,
 	pub peer_id: String,
@@ -62,12 +64,14 @@ pub fn publish_fast_prop_fired(
 	fire_utc: &str,
 	announce_utc: &str,
 	announce_unix_ms: i64,
+	offset_ms: u64,
 ) {
 	let fire_time = Utc::now();
 	let latency_ms = fire_time.timestamp_millis().saturating_sub(announce_unix_ms);
 	let notification = FastPropFiredNotification {
 		utc: fire_utc.to_string(),
 		announce_utc: announce_utc.to_string(),
+		offset_ms,
 		latency_ms,
 		event: "fast_prop_fired",
 		peer_id: peer_id.to_string(),
