@@ -1,7 +1,8 @@
-//! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms)` after a best block is downloaded.
+//! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms)` after a best block is executed.
 //!
-//! Trigger: block response processed in chain sync (`on_block_downloaded`), not the announce.
-//! If the node already had the block at announce time (`have_block`), fire runs immediately.
+//! Trigger: client import notification → `SyncingService::new_best_block_imported` →
+//! `on_best_block_executed` (Wasm `execute_block` and DB commit finished).
+//! Announce only records pending metadata (`announce_utc`) for latency reporting.
 //! Optional `target_block_number` on the pool entry restricts fires to that height.
 
 use crate::fast_prop_pool::{pool_accepts_block, take_pool, FastPropEntry};
@@ -19,10 +20,10 @@ pub struct FastPropBlockContext {
 	pub announce_utc: String,
 	/// Milliseconds since Unix epoch at announce receipt.
 	pub announce_unix_ms: i64,
-	/// RFC3339 UTC when the block became available locally (download finished or already had block).
-	pub download_utc: String,
-	/// Milliseconds since Unix epoch at download / local-availability time.
-	pub download_unix_ms: i64,
+	/// RFC3339 UTC when the block finished import (execution + state commit).
+	pub executed_utc: String,
+	/// Milliseconds since Unix epoch at import completion.
+	pub executed_unix_ms: i64,
 }
 
 /// Pending best-head from the latest matching `is_best` announce (single slot).
@@ -64,13 +65,12 @@ pub fn set_fire_handler(handler: Arc<FastPropFireHandler>) {
 	state().write().expect("fast prop lock").handler = Some(handler);
 }
 
-/// Record a best block announce (arms pending for download). Fires now if we already have the block.
+/// Record a best block announce (metadata only; does not fire).
 pub fn on_best_block_announced(
 	block_number: u64,
 	block_hash: String,
 	announce_utc: String,
 	announce_unix_ms: i64,
-	have_block: bool,
 ) {
 	if !pool_accepts_block(block_number) {
 		trace!(
@@ -80,27 +80,21 @@ pub fn on_best_block_announced(
 		return;
 	}
 
-	{
-		let mut guard = state().write().expect("fast prop lock");
-		guard.pending = Some(PendingBestAnnounce {
-			block_number,
-			block_hash: normalize_hash(&block_hash),
-			announce_utc,
-			announce_unix_ms,
-		});
-	}
+	let mut guard = state().write().expect("fast prop lock");
+	guard.pending = Some(PendingBestAnnounce {
+		block_number,
+		block_hash: normalize_hash(&block_hash),
+		announce_utc,
+		announce_unix_ms,
+	});
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: pending best announce registered #{block_number} have_block={have_block}"
+		"fast prop: pending best announce registered #{block_number}"
 	);
-
-	if have_block {
-		on_block_downloaded(block_number, block_hash);
-	}
 }
 
-/// Called when block data for a downloaded block is available (before import queue).
-pub fn on_block_downloaded(block_number: u64, block_hash: String) {
+/// Called when a block is imported as the new best (execution finished).
+pub fn on_best_block_executed(block_number: u64, block_hash: String) {
 	if !pool_accepts_block(block_number) {
 		return;
 	}
@@ -117,14 +111,14 @@ pub fn on_block_downloaded(block_number: u64, block_hash: String) {
 				if p.block_number != block_number {
 					trace!(
 						target: crate::LOG_TARGET,
-						"fast prop: download #{block_number} stale pending #{}",
+						"fast prop: executed #{block_number} stale pending #{}",
 						p.block_number,
 					);
 					guard.pending = Some(p);
 				}
 				trace!(
 					target: crate::LOG_TARGET,
-					"fast prop: download #{block_number} (pool armed, no matching announce)"
+					"fast prop: executed #{block_number} (pool armed, no matching announce)"
 				);
 				PendingBestAnnounce {
 					block_number,
@@ -136,7 +130,7 @@ pub fn on_block_downloaded(block_number: u64, block_hash: String) {
 			None => {
 				trace!(
 					target: crate::LOG_TARGET,
-					"fast prop: download #{block_number} with no prior announce (pool armed)"
+					"fast prop: executed #{block_number} with no prior announce (pool armed)"
 				);
 				PendingBestAnnounce {
 					block_number,
@@ -148,22 +142,22 @@ pub fn on_block_downloaded(block_number: u64, block_hash: String) {
 		}
 	};
 
-	let download_time = Utc::now();
-	let download_utc = download_time.to_rfc3339_opts(SecondsFormat::Millis, true);
-	let download_unix_ms = download_time.timestamp_millis();
+	let executed_time = Utc::now();
+	let executed_utc = executed_time.to_rfc3339_opts(SecondsFormat::Millis, true);
+	let executed_unix_ms = executed_time.timestamp_millis();
 
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: block #{block_number} downloaded, firing"
+		"fast prop: block #{block_number} executed (new best), firing"
 	);
 
-	try_fire(pending, download_utc, download_unix_ms);
+	try_fire(pending, executed_utc, executed_unix_ms);
 }
 
 fn try_fire(
 	pending: PendingBestAnnounce,
-	download_utc: String,
-	download_unix_ms: i64,
+	executed_utc: String,
+	executed_unix_ms: i64,
 ) {
 	let Some(entry) = take_pool() else {
 		debug!(
@@ -179,8 +173,8 @@ fn try_fire(
 		block_hash: pending.block_hash,
 		announce_utc: pending.announce_utc,
 		announce_unix_ms: pending.announce_unix_ms,
-		download_utc,
-		download_unix_ms,
+		executed_utc,
+		executed_unix_ms,
 	};
 
 	let handler = state().read().expect("fast prop lock").handler.clone();
@@ -200,7 +194,7 @@ fn try_fire(
 	let offset_ms = entry.offset_ms;
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: scheduling fire {}ms after block #{} download",
+		"fast prop: scheduling fire {}ms after block #{} execution",
 		offset_ms,
 		ctx.block_number,
 	);

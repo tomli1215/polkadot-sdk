@@ -10,10 +10,10 @@ pub struct FastPropEntry {
 	pub extrinsic: Vec<u8>,
 	/// libp2p peer id string (e.g. `12D3KooW…`).
 	pub peer_id: String,
-	/// Milliseconds to wait after block download before firing (0 = immediate).
+	/// Milliseconds to wait after block execution (import) before firing (0 = immediate).
 	#[serde(default)]
 	pub offset_ms: u64,
-	/// Fire only when this block number is downloaded (`0` = next matching best announce).
+	/// Fire only when this block number is executed as new best (`0` = next matching best).
 	#[serde(default)]
 	pub target_block_number: u64,
 }

@@ -34,7 +34,7 @@ use crate::{
 };
 
 use crate::block_announce_notify::publish_block_announce_received;
-use crate::fast_prop::on_best_block_announced;
+use crate::fast_prop::{on_best_block_announced, on_best_block_executed};
 
 use chrono::{SecondsFormat, Utc};
 use codec::{Decode, DecodeAll, Encode};
@@ -707,6 +707,9 @@ where
 			ToServiceCommand::NewBestBlockImported(hash, number) => {
 				log::debug!(target: LOG_TARGET, "New best block imported {:?}/#{}", hash, number);
 
+				let block_number: u64 = number.unique_saturated_into();
+				on_best_block_executed(block_number, format!("{hash:?}"));
+
 				self.strategy.update_chain_info(&hash, number);
 				let _ = self.notification_service.try_set_handshake(
 					BlockAnnouncesHandshake::<B>::build(
@@ -818,7 +821,6 @@ where
 						block_hash_str,
 						announce_utc,
 						announce_unix_ms,
-						have_block,
 					);
 				}
 
