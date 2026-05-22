@@ -34,7 +34,7 @@ use crate::{
 };
 
 use crate::block_announce_notify::publish_block_announce_received;
-use crate::fast_prop::try_fire_on_best_block_head;
+use crate::fast_prop::on_best_block_announced;
 
 use chrono::{SecondsFormat, Utc};
 use codec::{Decode, DecodeAll, Encode};
@@ -813,11 +813,12 @@ where
 					&announce_utc,
 				);
 				if is_best {
-					try_fire_on_best_block_head(
+					on_best_block_announced(
 						number,
 						block_hash_str,
 						announce_utc,
 						announce_unix_ms,
+						have_block,
 					);
 				}
 

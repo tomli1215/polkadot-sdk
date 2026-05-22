@@ -29,6 +29,7 @@
 //! order to update it.
 
 use crate::{
+	fast_prop::on_block_downloaded,
 	block_relay_protocol::{BlockDownloader, BlockResponseError},
 	blocks::BlockCollection,
 	justification_requests::ExtraRequests,
@@ -1153,6 +1154,13 @@ where
 		response: BlockResponse<B>,
 	) -> Result<(), BadPeer> {
 		self.downloaded_blocks += response.blocks.len();
+		for block in &response.blocks {
+			if let Some(header) = &block.header {
+				let number: u64 = (*header.number()).saturated_into();
+				let hash = format!("{:?}", block.hash);
+				on_block_downloaded(number, hash);
+			}
+		}
 		let mut gap = false;
 		let new_blocks: Vec<IncomingBlock<B>> = if let Some(peer) = self.peers.get_mut(peer_id) {
 			let mut blocks = response.blocks;
