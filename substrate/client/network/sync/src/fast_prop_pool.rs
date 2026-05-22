@@ -1,5 +1,6 @@
 //! Single-slot fast propagation pool: at most one `(extrinsic, peer_id)` entry.
 
+use sc_network_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::sync::{OnceLock, RwLock};
 
@@ -8,12 +9,12 @@ use std::sync::{OnceLock, RwLock};
 pub struct FastPropEntry {
 	/// SCALE-encoded extrinsic bytes.
 	pub extrinsic: Vec<u8>,
-	/// libp2p peer id string (e.g. `12D3KooW…`).
+	/// libp2p peer id string (e.g. `12D3KooW…`): fire when this peer announces the target block.
 	pub peer_id: String,
-	/// Milliseconds to wait after block execution (import) before firing (0 = immediate).
+	/// Milliseconds to wait after that peer's best block announce before firing (0 = immediate).
 	#[serde(default)]
 	pub offset_ms: u64,
-	/// Fire only when this block number is executed as new best (`0` = next matching best).
+	/// Fire only on a best announce for this block number from `peer_id` (`0` = next matching).
 	#[serde(default)]
 	pub target_block_number: u64,
 }
@@ -37,6 +38,11 @@ static POOL: OnceLock<RwLock<Option<FastPropEntry>>> = OnceLock::new();
 
 fn pool() -> &'static RwLock<Option<FastPropEntry>> {
 	POOL.get_or_init(|| RwLock::new(None))
+}
+
+fn peer_id_matches(expected: &str, actual: &PeerId) -> bool {
+	let expected = expected.trim();
+	!expected.is_empty() && actual.to_string() == expected
 }
 
 /// Insert or replace the single pool slot (later `setFastPropPool` overwrites a stale entry).
@@ -67,27 +73,17 @@ pub fn get_pool() -> FastPropPoolView {
 	}
 }
 
-/// Whether to store this best announce in the pending slot.
-///
-/// - Pool empty: always record (so an announce before `setFastPropPool` is not lost).
-/// - Pool set with a target height: only record matching heights (do not overwrite
-///   with the next block's announce while waiting to execute the target).
-pub fn should_record_pending_announce(block_number: u64) -> bool {
-	let guard = pool().read().expect("fast prop pool lock");
-	match guard.as_ref() {
-		None => true,
-		Some(entry) =>
-			entry.target_block_number == 0 || entry.target_block_number == block_number,
-	}
-}
-
-/// Returns true if the pool is set and accepts firing for `block_number`.
-pub fn pool_accepts_block(block_number: u64) -> bool {
+/// Returns true if the pool is armed and this peer's best announce at `block_number` should fire.
+pub fn pool_accepts_peer_announce(peer: &PeerId, block_number: u64) -> bool {
 	let guard = pool().read().expect("fast prop pool lock");
 	match guard.as_ref() {
 		None => false,
-		Some(entry) =>
-			entry.target_block_number == 0 || entry.target_block_number == block_number,
+		Some(entry) => {
+			if entry.target_block_number != 0 && entry.target_block_number != block_number {
+				return false;
+			}
+			peer_id_matches(&entry.peer_id, peer)
+		},
 	}
 }
 

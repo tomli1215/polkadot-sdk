@@ -15,9 +15,9 @@ pub struct FastPropFiredNotification {
 	pub utc: String,
 	/// RFC3339 UTC when the triggering best block announce was received.
 	pub announce_utc: String,
-	/// Configured delay from execution to fire (`FastPropEntry::offset_ms`).
+	/// Configured delay from announce to fire (`FastPropEntry::offset_ms`).
 	pub offset_ms: u64,
-	/// Milliseconds from best block announce to fire (actual; includes download + execute).
+	/// Milliseconds from the pool peer's best block announce to fire (actual; includes `offset_ms`).
 	pub latency_ms: i64,
 	pub event: &'static str,
 	pub peer_id: String,
