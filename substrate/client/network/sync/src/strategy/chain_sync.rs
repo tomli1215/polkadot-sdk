@@ -1157,7 +1157,7 @@ where
 		for block in &response.blocks {
 			if let Some(header) = &block.header {
 				let number: u64 = (*header.number()).saturated_into();
-				let hash = format!("{:?}", block.hash);
+				let hash = format!("{:?}", header.hash());
 				on_block_downloaded(number, hash);
 			}
 		}

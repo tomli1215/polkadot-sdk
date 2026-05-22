@@ -10,9 +10,12 @@ pub struct FastPropEntry {
 	pub extrinsic: Vec<u8>,
 	/// libp2p peer id string (e.g. `12D3KooW…`).
 	pub peer_id: String,
-	/// Milliseconds to wait after a best block announce before firing (0 = immediate).
+	/// Milliseconds to wait after block download before firing (0 = immediate).
 	#[serde(default)]
 	pub offset_ms: u64,
+	/// Fire only when this block number is downloaded (`0` = next matching best announce).
+	#[serde(default)]
+	pub target_block_number: u64,
 }
 
 /// Snapshot returned by RPC `get` (entry may be present without consuming the pool).
@@ -26,6 +29,8 @@ pub struct FastPropPoolView {
 	pub peer_id: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub offset_ms: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub target_block_number: Option<u64>,
 }
 
 static POOL: OnceLock<RwLock<Option<FastPropEntry>>> = OnceLock::new();
@@ -53,13 +58,25 @@ pub fn get_pool() -> FastPropPoolView {
 			extrinsic: None,
 			peer_id: None,
 			offset_ms: None,
+			target_block_number: None,
 		},
 		Some(entry) => FastPropPoolView {
 			occupied: true,
 			extrinsic: Some(entry.extrinsic.clone()),
 			peer_id: Some(entry.peer_id.clone()),
 			offset_ms: Some(entry.offset_ms),
+			target_block_number: Some(entry.target_block_number),
 		},
+	}
+}
+
+/// Returns true if the pool is set and accepts firing for `block_number`.
+pub fn pool_accepts_block(block_number: u64) -> bool {
+	let guard = pool().read().expect("fast prop pool lock");
+	match guard.as_ref() {
+		None => false,
+		Some(entry) =>
+			entry.target_block_number == 0 || entry.target_block_number == block_number,
 	}
 }
 
