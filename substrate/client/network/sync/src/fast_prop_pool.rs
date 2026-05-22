@@ -39,12 +39,9 @@ fn pool() -> &'static RwLock<Option<FastPropEntry>> {
 	POOL.get_or_init(|| RwLock::new(None))
 }
 
-/// Insert into the pool. Fails if the pool already holds an entry.
+/// Insert or replace the single pool slot (later `setFastPropPool` overwrites a stale entry).
 pub fn set_pool(entry: FastPropEntry) -> Result<(), &'static str> {
 	let mut guard = pool().write().expect("fast prop pool lock");
-	if guard.is_some() {
-		return Err("fast prop pool already occupied");
-	}
 	*guard = Some(entry);
 	Ok(())
 }
@@ -67,6 +64,20 @@ pub fn get_pool() -> FastPropPoolView {
 			offset_ms: Some(entry.offset_ms),
 			target_block_number: Some(entry.target_block_number),
 		},
+	}
+}
+
+/// Whether to store this best announce in the pending slot.
+///
+/// - Pool empty: always record (so an announce before `setFastPropPool` is not lost).
+/// - Pool set with a target height: only record matching heights (do not overwrite
+///   with the next block's announce while waiting to execute the target).
+pub fn should_record_pending_announce(block_number: u64) -> bool {
+	let guard = pool().read().expect("fast prop pool lock");
+	match guard.as_ref() {
+		None => true,
+		Some(entry) =>
+			entry.target_block_number == 0 || entry.target_block_number == block_number,
 	}
 }
 

@@ -2,10 +2,13 @@
 //!
 //! Trigger: client import notification → `SyncingService::new_best_block_imported` →
 //! `on_best_block_executed` (Wasm `execute_block` and DB commit finished).
-//! Announce only records pending metadata (`announce_utc`) for latency reporting.
+//! Best announces record pending metadata even before the pool is armed; a later
+//! announce for a different height does not overwrite while a target is set.
 //! Optional `target_block_number` on the pool entry restricts fires to that height.
 
-use crate::fast_prop_pool::{pool_accepts_block, take_pool, FastPropEntry};
+use crate::fast_prop_pool::{
+	pool_accepts_block, should_record_pending_announce, take_pool, FastPropEntry,
+};
 use chrono::{SecondsFormat, Utc};
 use log::{debug, trace};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -60,6 +63,30 @@ fn normalize_hash(hash: &str) -> String {
 	}
 }
 
+/// Drop pending announce metadata (e.g. when the pool target block changes).
+pub fn clear_pending_announce() {
+	state().write().expect("fast prop lock").pending = None;
+}
+
+/// If the new pool targets a different height, clear stale pending from a prior target.
+pub fn on_pool_replaced(new_target_block_number: u64) {
+	if new_target_block_number == 0 {
+		return;
+	}
+	let mut guard = state().write().expect("fast prop lock");
+	if guard
+		.pending
+		.as_ref()
+		.is_some_and(|p| p.block_number != new_target_block_number)
+	{
+		guard.pending = None;
+		trace!(
+			target: crate::LOG_TARGET,
+			"fast prop: cleared pending announce (pool target now #{new_target_block_number})"
+		);
+	}
+}
+
 /// Register the node callback (propagate → notify → mempool). Call once at startup.
 pub fn set_fire_handler(handler: Arc<FastPropFireHandler>) {
 	state().write().expect("fast prop lock").handler = Some(handler);
@@ -72,24 +99,27 @@ pub fn on_best_block_announced(
 	announce_utc: String,
 	announce_unix_ms: i64,
 ) {
-	if !pool_accepts_block(block_number) {
+	if !should_record_pending_announce(block_number) {
 		trace!(
 			target: crate::LOG_TARGET,
-			"fast prop: ignoring best announce #{block_number} (pool target mismatch or empty)"
+			"fast prop: skipping announce #{block_number} (pool targets another height)"
 		);
 		return;
 	}
 
-	let mut guard = state().write().expect("fast prop lock");
-	guard.pending = Some(PendingBestAnnounce {
-		block_number,
-		block_hash: normalize_hash(&block_hash),
-		announce_utc,
-		announce_unix_ms,
-	});
+	{
+		let mut guard = state().write().expect("fast prop lock");
+		guard.pending = Some(PendingBestAnnounce {
+			block_number,
+			block_hash: normalize_hash(&block_hash),
+			announce_utc,
+			announce_unix_ms,
+		});
+	}
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: pending best announce registered #{block_number}"
+		"fast prop: pending best announce registered #{block_number} pool_armed={}",
+		pool_accepts_block(block_number)
 	);
 }
 
