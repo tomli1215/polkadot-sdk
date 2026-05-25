@@ -23,7 +23,7 @@ use crate::{
 	fork_aware_txpool::ForkAwareTxPool as ForkAwareFullPool,
 	graph::{base_pool::Transaction, ChainApi, ExtrinsicFor, ExtrinsicHash, IsValidator, Options},
 	single_state_txpool::BasicPool as SingleStateFullPool,
-	TransactionPoolWrapper, LOG_TARGET,
+	transaction_pool_wrapper::TransactionPoolWrapper, LOG_TARGET,
 };
 use prometheus_endpoint::Registry as PrometheusRegistry;
 use sc_transaction_pool_api::{LocalTransactionPool, MaintainedTransactionPool};
@@ -231,21 +231,23 @@ where
 			future = ?self.options.options.future,
 			"Creating transaction pool"
 		);
-		TransactionPoolWrapper::<Block, Client>(match self.options.txpool_type {
-			TransactionPoolType::SingleState => Box::new(SingleStateFullPool::new_full(
-				self.options.options,
-				self.is_validator,
-				self.prometheus,
-				self.spawner,
-				self.client,
-			)),
-			TransactionPoolType::ForkAware => Box::new(ForkAwareFullPool::new_full(
-				self.options.options,
-				self.is_validator,
-				self.prometheus,
-				self.spawner,
-				self.client,
-			)),
-		})
+		let pool: Box<dyn FullClientTransactionPool<Block, Client>> =
+			match self.options.txpool_type {
+				TransactionPoolType::SingleState => Box::new(SingleStateFullPool::new_full(
+					self.options.options,
+					self.is_validator,
+					self.prometheus,
+					self.spawner,
+					self.client,
+				)),
+				TransactionPoolType::ForkAware => Box::new(ForkAwareFullPool::new_full(
+					self.options.options,
+					self.is_validator,
+					self.prometheus,
+					self.spawner,
+					self.client,
+				)),
+			};
+		TransactionPoolWrapper::<Block, Client>(pool)
 	}
 }
