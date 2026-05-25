@@ -1,10 +1,9 @@
 //! In-process broadcast of fast-propagation events for RPC subscribers.
 
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use futures::channel::mpsc;
 use futures::Stream;
 use serde::Serialize;
-use std::pin::Pin;
 use std::sync::{OnceLock, RwLock};
 
 /// Published after a pooled extrinsic is propagated on a best block-head signal.
@@ -15,11 +14,16 @@ pub struct FastPropFiredNotification {
 	pub utc: String,
 	/// RFC3339 UTC when the triggering best block announce was received.
 	pub announce_utc: String,
-	/// Configured delay from announce to fire (`FastPropEntry::offset_ms`).
+	/// Configured delay from trigger to fire (`FastPropEntry::offset_ms`).
 	pub offset_ms: u64,
-	/// Milliseconds from the pool peer's best block announce to fire (actual; includes `offset_ms`).
+	/// Milliseconds from the announce peer's best block announce to fire (actual; includes `offset_ms`).
 	pub latency_ms: i64,
 	pub event: &'static str,
+	/// Announce peer that triggered the fire.
+	pub announce_peer_id: String,
+	/// Peer that received the P2P extrinsic propagation.
+	pub propagate_peer_id: String,
+	/// Deprecated alias for `propagate_peer_id`.
 	pub peer_id: String,
 	#[serde(rename = "number")]
 	pub block_number: u64,
@@ -57,7 +61,8 @@ pub fn subscribe_fast_prop_fired() -> impl Stream<Item = FastPropFiredNotificati
 }
 
 pub fn publish_fast_prop_fired(
-	peer_id: &str,
+	announce_peer_id: &str,
+	propagate_peer_id: &str,
 	block_number: u64,
 	block_hash: &str,
 	extrinsic: &[u8],
@@ -74,7 +79,9 @@ pub fn publish_fast_prop_fired(
 		offset_ms,
 		latency_ms,
 		event: "fast_prop_fired",
-		peer_id: peer_id.to_string(),
+		announce_peer_id: announce_peer_id.to_string(),
+		propagate_peer_id: propagate_peer_id.to_string(),
+		peer_id: propagate_peer_id.to_string(),
 		block_number,
 		block_hash: block_hash.to_string(),
 		extrinsic: format!("0x{}", array_bytes::bytes2hex("", extrinsic)),

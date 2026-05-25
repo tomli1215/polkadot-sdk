@@ -1,31 +1,34 @@
-//! Single-slot fast propagation pool: at most one `(extrinsic, peer_id)` entry.
+//! Single-slot fast propagation pool: at most one armed extrinsic entry.
 
 use sc_network_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::sync::{OnceLock, RwLock};
 
-/// When to fire after the pool peer's best block announce at the target height.
+/// When to fire after the announce peer's best block announce at the target height.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FastPropFireMode {
-	/// Fire `offset_ms` after the pool peer's best block announce (default).
+	/// Fire `offset_ms` after the announce peer's best block announce (default).
 	#[default]
 	OnAnnounce = 0,
 	/// Fire `offset_ms` after this node finishes importing that block locally.
 	OnBlockImport = 1,
 }
 
-/// One pending fast-propagation transaction and its target peer.
+/// One pending fast-propagation transaction and its peer targets.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FastPropEntry {
 	/// SCALE-encoded extrinsic bytes.
 	pub extrinsic: Vec<u8>,
-	/// libp2p peer id string (e.g. `12D3KooW…`): fire when this peer announces the target block.
-	pub peer_id: String,
+	/// libp2p peer id: fire when this peer best-announces the target block.
+	#[serde(alias = "peer_id")]
+	pub announce_peer_id: String,
+	/// libp2p peer id: P2P propagation target when firing.
+	pub propagate_peer_id: String,
 	/// Milliseconds to wait after the fire trigger (announce or import per `fire_mode`).
 	#[serde(default)]
 	pub offset_ms: u64,
-	/// Fire only on a best announce for this block number from `peer_id` (`0` = next matching).
+	/// Fire only on a best announce for this block number from `announce_peer_id` (`0` = next matching).
 	#[serde(default)]
 	pub target_block_number: u64,
 	/// [`FastPropFireMode`] as `u8` (`0` = on announce, `1` = on local import).
@@ -40,6 +43,11 @@ pub struct FastPropPoolView {
 	pub occupied: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub extrinsic: Option<Vec<u8>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub announce_peer_id: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub propagate_peer_id: Option<String>,
+	/// Deprecated alias for `announce_peer_id`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub peer_id: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +97,8 @@ pub fn get_pool() -> FastPropPoolView {
 		None => FastPropPoolView {
 			occupied: false,
 			extrinsic: None,
+			announce_peer_id: None,
+			propagate_peer_id: None,
 			peer_id: None,
 			offset_ms: None,
 			target_block_number: None,
@@ -97,7 +107,9 @@ pub fn get_pool() -> FastPropPoolView {
 		Some(entry) => FastPropPoolView {
 			occupied: true,
 			extrinsic: Some(entry.extrinsic.clone()),
-			peer_id: Some(entry.peer_id.clone()),
+			announce_peer_id: Some(entry.announce_peer_id.clone()),
+			propagate_peer_id: Some(entry.propagate_peer_id.clone()),
+			peer_id: Some(entry.announce_peer_id.clone()),
 			offset_ms: Some(entry.offset_ms),
 			target_block_number: Some(entry.target_block_number),
 			fire_mode: Some(entry.fire_mode),
@@ -114,7 +126,7 @@ pub fn pool_accepts_peer_announce(peer: &PeerId, block_number: u64) -> bool {
 			if entry.target_block_number != 0 && entry.target_block_number != block_number {
 				return false;
 			}
-			peer_id_matches(&entry.peer_id, peer)
+			peer_id_matches(&entry.announce_peer_id, peer)
 		},
 	}
 }
