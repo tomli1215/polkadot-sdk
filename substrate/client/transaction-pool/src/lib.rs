@@ -45,7 +45,7 @@ pub use graph::{
 };
 use single_state_txpool::prune_known_txs_for_block;
 pub use single_state_txpool::{BasicPool, RevalidationType};
-pub use transaction_pool_wrapper::TransactionPoolWrapper;
+pub use sc_transaction_pool_api::pool_import_notify;
 
 type BoxedReadyIterator<Hash, Data> = Box<
 	dyn sc_transaction_pool_api::ReadyTransactions<

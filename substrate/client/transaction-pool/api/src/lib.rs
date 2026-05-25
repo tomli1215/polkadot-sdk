@@ -20,6 +20,7 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod pool_import_notify;
 
 use async_trait::async_trait;
 use codec::Codec;
