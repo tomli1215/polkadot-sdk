@@ -1,13 +1,16 @@
-//! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms)` when that peer sends a
-//! best block announce for the target height (header only; no wait for download or import).
+//! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms, fire_mode)` when the pool
+//! peer's best block announce matches (mode 0: after announce; mode 1: after local import).
 
-use crate::fast_prop_pool::{pool_accepts_peer_announce, take_pool, FastPropEntry};
+use crate::fast_prop_pool::{
+	clear_pending_import, pool_accepts_peer_announce, set_pending_import, take_pending_import_if_matches,
+	take_pool, FastPropEntry, FastPropFireMode,
+};
 use log::debug;
 use sc_network_types::PeerId;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-/// Context for the block announce that triggered a fast-prop fire.
+/// Context for the block announce / import that triggered a fast-prop fire.
 #[derive(Clone, Debug)]
 pub struct FastPropBlockContext {
 	pub block_number: u64,
@@ -16,8 +19,9 @@ pub struct FastPropBlockContext {
 	pub announce_utc: String,
 	/// Milliseconds since Unix epoch at announce receipt.
 	pub announce_unix_ms: i64,
-	/// Same instant as announce (kept for downstream RPC / handler compatibility).
+	/// RFC3339 UTC when the fire trigger fired (announce or local import per `fire_mode`).
 	pub executed_utc: String,
+	/// Milliseconds since Unix epoch at fire trigger.
 	pub executed_unix_ms: i64,
 }
 
@@ -48,22 +52,47 @@ pub fn set_fire_handler(handler: Arc<FastPropFireHandler>) {
 	state().write().expect("fast prop lock").handler = Some(handler);
 }
 
-/// Best block announce from `peer`: fire immediately when it matches the armed pool entry.
+/// Best block announce from `peer`: arm or fire when it matches the pool entry.
 pub fn on_target_peer_block_announced(
 	peer: &PeerId,
 	block_number: u64,
 	block_hash: String,
 	announce_utc: String,
 	announce_unix_ms: i64,
+	local_have_block: bool,
 ) {
 	if !pool_accepts_peer_announce(peer, block_number) {
 		return;
 	}
 
+	let Some(entry) = take_pool() else {
+		return;
+	};
+
+	let fire_mode = entry.fire_mode;
 	let hash_norm = normalize_hash(&block_hash);
+
+	if fire_mode == FastPropFireMode::OnBlockImport as u8 {
+		debug!(
+			target: crate::LOG_TARGET,
+			"fast prop: best announce #{block_number} from {peer}, waiting for local import"
+		);
+		set_pending_import(
+			entry,
+			block_number,
+			hash_norm.clone(),
+			announce_utc.clone(),
+			announce_unix_ms,
+		);
+		if local_have_block {
+			on_block_imported(block_number, &hash_norm);
+		}
+		return;
+	}
+
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: best announce #{block_number} from {peer}, firing"
+		"fast prop: best announce #{block_number} from {peer}, firing (mode=announce)"
 	);
 
 	let ctx = FastPropBlockContext {
@@ -75,25 +104,47 @@ pub fn on_target_peer_block_announced(
 		executed_unix_ms: announce_unix_ms,
 	};
 
-	try_fire(ctx);
+	schedule_fire(entry, ctx);
 }
 
-fn try_fire(ctx: FastPropBlockContext) {
-	let Some(entry) = take_pool() else {
-		debug!(
-			target: crate::LOG_TARGET,
-			"fast prop: pool empty at fire time for #{}",
-			ctx.block_number,
-		);
+/// Local block import finished: fire in mode 1 when it matches pending pool peer announce.
+pub fn on_block_imported(block_number: u64, block_hash: &str) {
+	let hash_norm = normalize_hash(block_hash);
+	let Some((entry, _pending_number, _pending_hash, announce_utc, announce_unix_ms)) =
+		take_pending_import_if_matches(block_number, &hash_norm)
+	else {
 		return;
 	};
 
+	let import_time = chrono::Utc::now();
+	let executed_utc = import_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+	let executed_unix_ms = import_time.timestamp_millis();
+
+	debug!(
+		target: crate::LOG_TARGET,
+		"fast prop: block #{block_number} imported locally, firing (mode=import)"
+	);
+
+	let ctx = FastPropBlockContext {
+		block_number,
+		block_hash: hash_norm,
+		announce_utc,
+		announce_unix_ms,
+		executed_utc,
+		executed_unix_ms,
+	};
+
+	schedule_fire(entry, ctx);
+}
+
+fn schedule_fire(entry: FastPropEntry, ctx: FastPropBlockContext) {
 	let handler = state().read().expect("fast prop lock").handler.clone();
 	let Some(handler) = handler else {
 		log::warn!(
 			target: crate::LOG_TARGET,
 			"fast prop pool entry dropped: no fire handler registered"
 		);
+		clear_pending_import();
 		return;
 	};
 
@@ -105,7 +156,7 @@ fn try_fire(ctx: FastPropBlockContext) {
 	let offset_ms = entry.offset_ms;
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: scheduling fire {}ms after announce for block #{}",
+		"fast prop: scheduling fire {}ms after trigger for block #{}",
 		offset_ms,
 		ctx.block_number,
 	);

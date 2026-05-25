@@ -34,7 +34,7 @@ use crate::{
 };
 
 use crate::block_announce_notify::publish_block_announce_received;
-use crate::fast_prop::on_target_peer_block_announced;
+use crate::fast_prop::{on_block_imported, on_target_peer_block_announced};
 
 use chrono::{SecondsFormat, Utc};
 use codec::{Decode, DecodeAll, Encode};
@@ -688,6 +688,13 @@ where
 			ToServiceCommand::ClearJustificationRequests =>
 				self.strategy.clear_justification_requests(),
 			ToServiceCommand::BlocksProcessed(imported, count, results) => {
+				for (result, hash) in &results {
+					if let Ok(status) = result {
+						let number: u64 = (*status.number()).unique_saturated_into();
+						let block_hash_str = format!("{hash:?}");
+						on_block_imported(number, &block_hash_str);
+					}
+				}
 				self.strategy.on_blocks_processed(imported, count, results);
 			},
 			ToServiceCommand::JustificationImported(peer_id, hash, number, success) => {
@@ -819,6 +826,7 @@ where
 						block_hash_str,
 						announce_utc,
 						announce_unix_ms,
+						have_block,
 					);
 				}
 
