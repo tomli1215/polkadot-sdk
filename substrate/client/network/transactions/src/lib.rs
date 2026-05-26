@@ -194,6 +194,40 @@ impl TransactionsHandlerPrototype {
 		let fast_prop_sinks = Arc::new(RwLock::new(HashMap::new()));
 		let sync_for_fast_prop: Arc<dyn sp_consensus::SyncOracle + Send + Sync> =
 			Arc::new(SyncOraclePtr(sync.clone()));
+		register_fast_prop_multi_peer_propagator(Arc::new({
+			let enqueue = to_handler.clone();
+			let peers = fast_prop_peers.clone();
+			let sync = sync_for_fast_prop.clone();
+			move |extrinsic: Vec<u8>, peer_ids: &[PeerId]| {
+				let controller = TransactionsHandlerController { to_handler: enqueue.clone() };
+				if sync.is_major_syncing() {
+					return peer_ids
+						.iter()
+						.copied()
+						.map(|peer_id| FastPropPeerSendResult {
+							peer_id,
+							status: FastPropSendStatus::Syncing,
+						})
+						.collect();
+				}
+				peer_ids
+					.iter()
+					.copied()
+					.map(|peer_id| {
+						let status = match peers.read().expect("fast prop peers lock").get(&peer_id) {
+							None => FastPropSendStatus::PeerNotConnected,
+							Some(role) if matches!(role, ObservedRole::Light) =>
+								FastPropSendStatus::LightClient,
+							Some(_) => {
+								controller.propagate_extrinsic_to_peer(extrinsic.clone(), peer_id);
+								FastPropSendStatus::Sent
+							},
+						};
+						FastPropPeerSendResult { peer_id, status }
+					})
+					.collect()
+			}
+		}));
 		register_fast_prop_propagator(Arc::new({
 			let peers = fast_prop_peers.clone();
 			let sinks = fast_prop_sinks.clone();
@@ -227,7 +261,6 @@ impl TransactionsHandlerPrototype {
 		};
 
 		let controller = TransactionsHandlerController { to_handler };
-
 		Ok((handler, controller))
 	}
 }
@@ -358,13 +391,29 @@ fn fast_prop_try_send_immediate(
 
 static FAST_PROP_PROPAGATOR: OnceLock<RwLock<Option<Arc<FastPropPropagator>>>> = OnceLock::new();
 
+type FastPropMultiPeerPropagator = dyn Fn(Vec<u8>, &[PeerId]) -> Vec<FastPropPeerSendResult> + Send + Sync;
+
+static FAST_PROP_MULTI_PEER_PROPAGATOR: OnceLock<RwLock<Option<Arc<FastPropMultiPeerPropagator>>>> =
+	OnceLock::new();
+
 fn fast_prop_propagator_slot() -> &'static RwLock<Option<Arc<FastPropPropagator>>> {
 	FAST_PROP_PROPAGATOR.get_or_init(|| RwLock::new(None))
+}
+
+fn fast_prop_multi_peer_propagator_slot() -> &'static RwLock<Option<Arc<FastPropMultiPeerPropagator>>> {
+	FAST_PROP_MULTI_PEER_PROPAGATOR.get_or_init(|| RwLock::new(None))
 }
 
 /// Register P2P propagation for the fast-prop pool (node calls once at startup).
 pub fn register_fast_prop_propagator(propagator: Arc<FastPropPropagator>) {
 	*fast_prop_propagator_slot().write().expect("fast prop propagator lock") = Some(propagator);
+}
+
+/// Register multi-peer propagation via the transactions handler task (immediate RPC path).
+pub fn register_fast_prop_multi_peer_propagator(propagator: Arc<FastPropMultiPeerPropagator>) {
+	*fast_prop_multi_peer_propagator_slot()
+		.write()
+		.expect("fast prop multi peer propagator lock") = Some(propagator);
 }
 
 /// Propagate a SCALE-encoded extrinsic to one peer (used from fast-prop fire handler).
@@ -395,10 +444,20 @@ pub fn fast_prop_propagate_extrinsic_with_status(
 }
 
 /// Propagate the same SCALE extrinsic to many peers immediately (no transaction pool).
+///
+/// Uses the transactions-handler notification path when registered (RPC / scanner);
+/// armed single-peer fire keeps the immediate MessageSink path.
 pub fn fast_prop_propagate_extrinsic_to_peers(
 	extrinsic: Vec<u8>,
 	peer_ids: impl IntoIterator<Item = PeerId>,
 ) -> Vec<FastPropPeerSendResult> {
+	let peer_ids: Vec<PeerId> = peer_ids.into_iter().collect();
+	if let Some(multi) =
+		fast_prop_multi_peer_propagator_slot().read().expect("fast prop multi peer lock").clone()
+	{
+		return multi(extrinsic, &peer_ids);
+	}
+
 	let propagator = fast_prop_propagator_slot().read().expect("fast prop propagator lock").clone();
 	let Some(propagate) = propagator else {
 		return peer_ids
