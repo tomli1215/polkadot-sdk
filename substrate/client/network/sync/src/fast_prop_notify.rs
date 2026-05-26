@@ -16,6 +16,13 @@ pub struct FastPropFiredNotification {
 	pub announce_utc: String,
 	/// Configured delay from trigger to fire (`FastPropEntry::offset_ms`).
 	pub offset_ms: u64,
+	/// Delay actually applied for this fire (`0` for mode-2 `transactMatch`).
+	pub offset_applied_ms: u64,
+	/// What invoked the fire: `onAnnounce`, `blockImport`, or `transactMatch`.
+	pub fire_trigger: String,
+	/// EVM `to` when `fire_trigger` is `transactMatch`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub matched_call_address: Option<String>,
 	/// Milliseconds from the announce peer's best block announce to fire (actual; includes `offset_ms`).
 	pub latency_ms: i64,
 	pub event: &'static str,
@@ -70,6 +77,9 @@ pub fn publish_fast_prop_fired(
 	announce_utc: &str,
 	announce_unix_ms: i64,
 	offset_ms: u64,
+	offset_applied_ms: u64,
+	fire_trigger: &str,
+	matched_call_address: Option<String>,
 ) {
 	let fire_time = Utc::now();
 	let latency_ms = fire_time.timestamp_millis().saturating_sub(announce_unix_ms);
@@ -77,6 +87,9 @@ pub fn publish_fast_prop_fired(
 		utc: fire_utc.to_string(),
 		announce_utc: announce_utc.to_string(),
 		offset_ms,
+		offset_applied_ms,
+		fire_trigger: fire_trigger.to_string(),
+		matched_call_address,
 		latency_ms,
 		event: "fast_prop_fired",
 		announce_peer_id: announce_peer_id.to_string(),

@@ -12,6 +12,32 @@ use sc_network_types::PeerId;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
+/// What caused the pool to fire (reflected in RPC `fireTrigger`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FastPropFireTrigger {
+	/// Mode 0: announce peer best block announce at target height.
+	OnAnnounce,
+	/// Mode 1 / mode 2 import path: local block import matching pending announce.
+	BlockImport,
+	/// Mode 2: new `Ethereum.transact` with EVM `to` in `watch_call_addresses`.
+	TransactMatch,
+}
+
+impl FastPropFireTrigger {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::OnAnnounce => "onAnnounce",
+			Self::BlockImport => "blockImport",
+			Self::TransactMatch => "transactMatch",
+		}
+	}
+
+	/// Mode 2 transact match fires immediately; import/announce honor `offset_ms`.
+	pub fn applies_offset_ms(self) -> bool {
+		!matches!(self, Self::TransactMatch)
+	}
+}
+
 /// Context for the block announce / import that triggered a fast-prop fire.
 #[derive(Clone, Debug)]
 pub struct FastPropBlockContext {
@@ -25,6 +51,9 @@ pub struct FastPropBlockContext {
 	pub executed_utc: String,
 	/// Milliseconds since Unix epoch at fire trigger.
 	pub executed_unix_ms: i64,
+	pub trigger: FastPropFireTrigger,
+	/// Set when `trigger` is [`FastPropFireTrigger::TransactMatch`].
+	pub matched_call_address: Option<String>,
 }
 
 struct FastPropState {
@@ -106,6 +135,8 @@ pub fn on_target_peer_block_announced(
 		announce_unix_ms,
 		executed_utc: announce_utc,
 		executed_unix_ms: announce_unix_ms,
+		trigger: FastPropFireTrigger::OnAnnounce,
+		matched_call_address: None,
 	};
 
 	schedule_fire(entry, ctx);
@@ -136,6 +167,8 @@ pub fn on_block_imported(block_number: u64, block_hash: &str) {
 		announce_unix_ms,
 		executed_utc,
 		executed_unix_ms,
+		trigger: FastPropFireTrigger::BlockImport,
+		matched_call_address: None,
 	};
 
 	schedule_fire(entry, ctx);
@@ -147,6 +180,9 @@ pub fn on_mixed_mode_ethereum_transact(
 	block_number: u64,
 	block_hash: String,
 ) {
+	let matched_call_address =
+		Some(crate::fast_prop_pool::normalize_call_address_bytes(&call_to));
+
 	if let Some(entry) = take_pool_on_mixed_transact_match(&call_to, block_number) {
 		clear_pending_import();
 		let now = chrono::Utc::now();
@@ -163,6 +199,8 @@ pub fn on_mixed_mode_ethereum_transact(
 			announce_unix_ms: executed_unix_ms,
 			executed_utc,
 			executed_unix_ms,
+			trigger: FastPropFireTrigger::TransactMatch,
+			matched_call_address: matched_call_address.clone(),
 		};
 		schedule_fire(entry, ctx);
 		return;
@@ -188,6 +226,8 @@ pub fn on_mixed_mode_ethereum_transact(
 		announce_unix_ms,
 		executed_utc,
 		executed_unix_ms,
+		trigger: FastPropFireTrigger::TransactMatch,
+		matched_call_address,
 	};
 	schedule_fire(entry, ctx);
 }
@@ -203,16 +243,22 @@ fn schedule_fire(entry: FastPropEntry, ctx: FastPropBlockContext) {
 		return;
 	};
 
-	if entry.offset_ms == 0 {
+	let offset_ms = if ctx.trigger.applies_offset_ms() {
+		entry.offset_ms
+	} else {
+		0
+	};
+
+	if offset_ms == 0 {
 		handler(entry, ctx);
 		return;
 	}
 
-	let offset_ms = entry.offset_ms;
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: scheduling fire {}ms after trigger for block #{}",
+		"fast prop: scheduling fire {}ms after trigger ({}) for block #{}",
 		offset_ms,
+		ctx.trigger.as_str(),
 		ctx.block_number,
 	);
 	tokio::spawn(async move {
