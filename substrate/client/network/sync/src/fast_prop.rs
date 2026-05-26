@@ -1,9 +1,11 @@
 //! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms, fire_mode)` when the pool
-//! peer's best block announce matches (mode 0: after announce; mode 1: after local import).
+//! peer's best block announce matches (mode 0: after announce; mode 1: after local import;
+//! mode 2: mixed — matching `Ethereum.transact` or local import).
 
 use crate::fast_prop_pool::{
-	clear_pending_import, pool_accepts_peer_announce, set_pending_import, take_pending_import_if_matches,
-	take_pool, FastPropEntry, FastPropFireMode,
+	clear_pending_import, pool_accepts_peer_announce, set_pending_import,
+	take_pending_import_if_matches, take_pending_import_on_mixed_transact_match,
+	take_pool, take_pool_on_mixed_transact_match, FastPropEntry, FastPropFireMode,
 };
 use log::debug;
 use sc_network_types::PeerId;
@@ -72,10 +74,12 @@ pub fn on_target_peer_block_announced(
 	let fire_mode = entry.fire_mode;
 	let hash_norm = normalize_hash(&block_hash);
 
-	if fire_mode == FastPropFireMode::OnBlockImport as u8 {
+	if fire_mode == FastPropFireMode::OnBlockImport as u8
+		|| fire_mode == FastPropFireMode::Mixed as u8
+	{
 		debug!(
 			target: crate::LOG_TARGET,
-			"fast prop: best announce #{block_number} from {peer}, waiting for local import"
+			"fast prop: best announce #{block_number} from {peer}, waiting for local import (mode={fire_mode})"
 		);
 		set_pending_import(
 			entry,
@@ -134,6 +138,57 @@ pub fn on_block_imported(block_number: u64, block_hash: &str) {
 		executed_unix_ms,
 	};
 
+	schedule_fire(entry, ctx);
+}
+
+/// Mode 2: a new `Ethereum.transact` entered the ready pool with a matching EVM `to` address.
+pub fn on_mixed_mode_ethereum_transact(
+	call_to: [u8; 20],
+	block_number: u64,
+	block_hash: String,
+) {
+	if let Some(entry) = take_pool_on_mixed_transact_match(&call_to, block_number) {
+		clear_pending_import();
+		let now = chrono::Utc::now();
+		let executed_utc = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+		let executed_unix_ms = now.timestamp_millis();
+		debug!(
+			target: crate::LOG_TARGET,
+			"fast prop: matching Ethereum.transact in ready pool, firing (mode=mixed/transact)"
+		);
+		let ctx = FastPropBlockContext {
+			block_number,
+			block_hash: normalize_hash(&block_hash),
+			announce_utc: executed_utc.clone(),
+			announce_unix_ms: executed_unix_ms,
+			executed_utc,
+			executed_unix_ms,
+		};
+		schedule_fire(entry, ctx);
+		return;
+	}
+
+	let Some((entry, pending_number, pending_hash, announce_utc, announce_unix_ms)) =
+		take_pending_import_on_mixed_transact_match(&call_to, block_number)
+	else {
+		return;
+	};
+
+	let now = chrono::Utc::now();
+	let executed_utc = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+	let executed_unix_ms = now.timestamp_millis();
+	debug!(
+		target: crate::LOG_TARGET,
+		"fast prop: matching Ethereum.transact while pending import, firing (mode=mixed/transact)"
+	);
+	let ctx = FastPropBlockContext {
+		block_number: pending_number,
+		block_hash: pending_hash,
+		announce_utc,
+		announce_unix_ms,
+		executed_utc,
+		executed_unix_ms,
+	};
 	schedule_fire(entry, ctx);
 }
 
