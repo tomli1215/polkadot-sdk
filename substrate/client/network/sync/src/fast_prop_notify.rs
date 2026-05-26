@@ -28,10 +28,14 @@ pub struct FastPropFiredNotification {
 	pub event: &'static str,
 	/// Announce peer that triggered the fire.
 	pub announce_peer_id: String,
-	/// Peer that received the P2P extrinsic propagation.
+	/// Peers that received the P2P extrinsic propagation.
+	pub propagate_peer_ids: Vec<String>,
+	/// First propagate peer (backward compatible with single-peer clients).
 	pub propagate_peer_id: String,
 	/// Deprecated alias for `propagate_peer_id`.
 	pub peer_id: String,
+	/// Peers that accepted immediate P2P propagation (`send_sync_notification`).
+	pub sent_count: usize,
 	#[serde(rename = "number")]
 	pub block_number: u64,
 	pub block_hash: String,
@@ -69,7 +73,7 @@ pub fn subscribe_fast_prop_fired() -> impl Stream<Item = FastPropFiredNotificati
 
 pub fn publish_fast_prop_fired(
 	announce_peer_id: &str,
-	propagate_peer_id: &str,
+	propagate_peer_ids: &[String],
 	block_number: u64,
 	block_hash: &str,
 	extrinsic: &[u8],
@@ -80,9 +84,15 @@ pub fn publish_fast_prop_fired(
 	offset_applied_ms: u64,
 	fire_trigger: &str,
 	matched_call_address: Option<String>,
+	sent_count: usize,
 ) {
 	let fire_time = Utc::now();
 	let latency_ms = fire_time.timestamp_millis().saturating_sub(announce_unix_ms);
+	let primary = propagate_peer_ids
+		.first()
+		.map(|s| s.as_str())
+		.filter(|s| !s.is_empty())
+		.unwrap_or("");
 	let notification = FastPropFiredNotification {
 		utc: fire_utc.to_string(),
 		announce_utc: announce_utc.to_string(),
@@ -93,8 +103,10 @@ pub fn publish_fast_prop_fired(
 		latency_ms,
 		event: "fast_prop_fired",
 		announce_peer_id: announce_peer_id.to_string(),
-		propagate_peer_id: propagate_peer_id.to_string(),
-		peer_id: propagate_peer_id.to_string(),
+		propagate_peer_ids: propagate_peer_ids.to_vec(),
+		propagate_peer_id: primary.to_string(),
+		peer_id: primary.to_string(),
+		sent_count,
 		block_number,
 		block_hash: block_hash.to_string(),
 		extrinsic: format!("0x{}", array_bytes::bytes2hex("", extrinsic)),

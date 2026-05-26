@@ -1,8 +1,9 @@
 //! Single-slot fast propagation pool: at most one armed extrinsic entry.
 
 use sc_network_types::PeerId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::{OnceLock, RwLock};
 
 /// When to fire after the announce peer's best block announce at the target height.
@@ -37,8 +38,14 @@ pub struct FastPropEntry {
 	/// libp2p peer id: fire when this peer best-announces the target block.
 	#[serde(alias = "peer_id")]
 	pub announce_peer_id: String,
-	/// libp2p peer id: P2P propagation target when firing.
-	pub propagate_peer_id: String,
+	/// libp2p peer ids: P2P propagation targets when firing (all receive the extrinsic).
+	/// JSON may use legacy key `propagate_peer_id` (string) or `propagate_peer_ids` (array).
+	#[serde(
+		default,
+		alias = "propagate_peer_id",
+		deserialize_with = "deserialize_propagate_peer_ids"
+	)]
+	pub propagate_peer_ids: Vec<String>,
 	/// Milliseconds to wait after the fire trigger (announce or import per `fire_mode`).
 	#[serde(default)]
 	pub offset_ms: u64,
@@ -64,6 +71,8 @@ pub struct FastPropPoolView {
 	pub announce_peer_id: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub propagate_peer_id: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub propagate_peer_ids: Option<Vec<String>>,
 	/// Deprecated alias for `announce_peer_id`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub peer_id: Option<String>,
@@ -91,6 +100,73 @@ static IMPORT_BASELINE: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 
 fn pool() -> &'static RwLock<Option<FastPropEntry>> {
 	POOL.get_or_init(|| RwLock::new(None))
+}
+
+fn deserialize_propagate_peer_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	struct PropagatePeerIdsVisitor;
+
+	impl<'de> serde::de::Visitor<'de> for PropagatePeerIdsVisitor {
+		type Value = Vec<String>;
+
+		fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+			formatter.write_str("a peer id string or an array of peer id strings")
+		}
+
+		fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+		where
+			E: serde::de::Error,
+		{
+			let trimmed = value.trim();
+			if trimmed.is_empty() {
+				Ok(Vec::new())
+			} else {
+				Ok(vec![trimmed.to_string()])
+			}
+		}
+
+		fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+		where
+			A: serde::de::SeqAccess<'de>,
+		{
+			let mut out = Vec::new();
+			while let Some(value) = seq.next_element::<String>()? {
+				let trimmed = value.trim();
+				if !trimmed.is_empty() {
+					out.push(trimmed.to_string());
+				}
+			}
+			Ok(out)
+		}
+	}
+
+	deserializer.deserialize_any(PropagatePeerIdsVisitor)
+}
+
+fn dedupe_peer_id_strings(peer_ids: Vec<String>) -> Vec<String> {
+	let mut seen = HashSet::new();
+	peer_ids
+		.into_iter()
+		.filter(|id| !id.trim().is_empty())
+		.filter(|id| seen.insert(id.clone()))
+		.collect()
+}
+
+impl FastPropEntry {
+	/// Dedupe non-empty propagate peer ids.
+	pub fn normalize_propagate_peers(&mut self) {
+		self.propagate_peer_ids = dedupe_peer_id_strings(std::mem::take(&mut self.propagate_peer_ids));
+	}
+
+	pub fn primary_propagate_peer_id(&self) -> &str {
+		self.propagate_peer_ids
+			.first()
+			.map(|s| s.as_str())
+			.filter(|s| !s.is_empty())
+			.unwrap_or("")
+	}
 }
 
 fn pending_import() -> &'static RwLock<Option<PendingImportFire>> {
@@ -169,7 +245,11 @@ pub fn mixed_mode_active() -> bool {
 }
 
 /// Insert or replace the single pool slot (later `setFastPropPool` overwrites a stale entry).
-pub fn set_pool(entry: FastPropEntry) -> Result<(), &'static str> {
+pub fn set_pool(mut entry: FastPropEntry) -> Result<(), &'static str> {
+	entry.normalize_propagate_peers();
+	if entry.propagate_peer_ids.is_empty() {
+		return Err("propagate_peer_ids must not be empty");
+	}
 	clear_pending_import();
 	if entry.fire_mode != FastPropFireMode::Mixed as u8 {
 		clear_import_baseline();
@@ -188,6 +268,7 @@ pub fn get_pool() -> FastPropPoolView {
 			extrinsic: None,
 			announce_peer_id: None,
 			propagate_peer_id: None,
+			propagate_peer_ids: None,
 			peer_id: None,
 			offset_ms: None,
 			target_block_number: None,
@@ -198,7 +279,8 @@ pub fn get_pool() -> FastPropPoolView {
 			occupied: true,
 			extrinsic: Some(entry.extrinsic.clone()),
 			announce_peer_id: Some(entry.announce_peer_id.clone()),
-			propagate_peer_id: Some(entry.propagate_peer_id.clone()),
+			propagate_peer_id: Some(entry.primary_propagate_peer_id().to_string()),
+			propagate_peer_ids: Some(entry.propagate_peer_ids.clone()),
 			peer_id: Some(entry.announce_peer_id.clone()),
 			offset_ms: Some(entry.offset_ms),
 			target_block_number: Some(entry.target_block_number),
