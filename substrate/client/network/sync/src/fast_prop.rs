@@ -1,6 +1,6 @@
 //! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms, fire_mode)` when the pool
-//! peer's best block announce matches (mode 0: after announce; mode 1: after local import;
-//! mode 2: mixed — matching `Ethereum.transact` or local import).
+//! trigger matches (mode 0: announce peer best announce; mode 1/2: any peer announce then
+//! local import; mode 2: or matching `Ethereum.transact`; mode 3: transact match only).
 
 use crate::fast_prop_pool::{
 	clear_pending_import, pool_accepts_peer_announce, set_pending_import,
@@ -103,8 +103,8 @@ pub fn on_target_peer_block_announced(
 	let fire_mode = entry.fire_mode;
 	let hash_norm = normalize_hash(&block_hash);
 
-	if fire_mode == FastPropFireMode::OnBlockImport as u8
-		|| fire_mode == FastPropFireMode::Mixed as u8
+	if FastPropFireMode::from_u8(fire_mode)
+		.is_some_and(|m| m.uses_import_pending_from_announce())
 	{
 		debug!(
 			target: crate::LOG_TARGET,

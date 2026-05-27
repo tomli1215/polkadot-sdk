@@ -17,6 +17,8 @@ pub enum FastPropFireMode {
 	OnBlockImport = 1,
 	/// Fire on matching incoming `Ethereum.transact` **or** after local block import (mode 1 path).
 	Mixed = 2,
+	/// Fire only on matching incoming `Ethereum.transact` (no announce / import trigger).
+	TransactMatch = 3,
 }
 
 impl FastPropFireMode {
@@ -25,8 +27,17 @@ impl FastPropFireMode {
 			0 => Some(Self::OnAnnounce),
 			1 => Some(Self::OnBlockImport),
 			2 => Some(Self::Mixed),
+			3 => Some(Self::TransactMatch),
 			_ => None,
 		}
+	}
+
+	pub fn uses_transact_watch(self) -> bool {
+		matches!(self, Self::Mixed | Self::TransactMatch)
+	}
+
+	pub fn uses_import_pending_from_announce(self) -> bool {
+		matches!(self, Self::OnBlockImport | Self::Mixed)
 	}
 }
 
@@ -52,7 +63,7 @@ pub struct FastPropEntry {
 	/// Fire only on a best announce for this block number from `announce_peer_id` (`0` = next matching).
 	#[serde(default)]
 	pub target_block_number: u64,
-	/// [`FastPropFireMode`] as `u8` (`0` = on announce, `1` = on local import, `2` = mixed).
+	/// [`FastPropFireMode`] as `u8` (`0` announce, `1` import, `2` mixed, `3` transact-only).
 	#[serde(default)]
 	pub fire_mode: u8,
 	/// Mode 2: inner EVM `to` addresses (`0x` + 40 hex) for incoming `Ethereum.transact`.
@@ -227,13 +238,16 @@ pub fn is_import_baseline_hash(hash: &str) -> bool {
 	import_baseline().read().expect("fast prop baseline lock").contains(hash)
 }
 
-/// Mode 2 armed in the pool slot or waiting for local import after announce.
-pub fn mixed_mode_active() -> bool {
+/// Mode 2 / 3: watch ready pool for matching `Ethereum.transact`.
+pub fn transact_watch_mode_active() -> bool {
 	let pool_armed = pool()
 		.read()
 		.expect("fast prop pool lock")
 		.as_ref()
-		.is_some_and(|e| e.fire_mode == FastPropFireMode::Mixed as u8);
+		.is_some_and(|e| {
+			FastPropFireMode::from_u8(e.fire_mode)
+				.is_some_and(|m| m.uses_transact_watch())
+		});
 	if pool_armed {
 		return true;
 	}
@@ -244,6 +258,11 @@ pub fn mixed_mode_active() -> bool {
 		.is_some_and(|p| p.entry.fire_mode == FastPropFireMode::Mixed as u8)
 }
 
+/// Back-compat alias for [`transact_watch_mode_active`].
+pub fn mixed_mode_active() -> bool {
+	transact_watch_mode_active()
+}
+
 /// Insert or replace the single pool slot (later `setFastPropPool` overwrites a stale entry).
 pub fn set_pool(mut entry: FastPropEntry) -> Result<(), &'static str> {
 	entry.normalize_propagate_peers();
@@ -251,7 +270,9 @@ pub fn set_pool(mut entry: FastPropEntry) -> Result<(), &'static str> {
 		return Err("propagate_peer_ids must not be empty");
 	}
 	clear_pending_import();
-	if entry.fire_mode != FastPropFireMode::Mixed as u8 {
+	if !FastPropFireMode::from_u8(entry.fire_mode)
+		.is_some_and(|m| m.uses_transact_watch())
+	{
 		clear_import_baseline();
 	}
 	let mut guard = pool().write().expect("fast prop pool lock");
@@ -294,28 +315,35 @@ pub fn get_pool() -> FastPropPoolView {
 	}
 }
 
-/// Returns true if the pool is armed and this peer's best announce at `block_number` should fire.
+/// Returns true if this best-block announce should arm the import-pending path or fire (mode 0).
 pub fn pool_accepts_peer_announce(peer: &PeerId, block_number: u64) -> bool {
 	let guard = pool().read().expect("fast prop pool lock");
-	match guard.as_ref() {
-		None => false,
-		Some(entry) => {
-			if !target_block_matches(entry, block_number) {
-				return false;
-			}
-			peer_id_matches(&entry.announce_peer_id, peer)
-		},
+	let Some(entry) = guard.as_ref() else {
+		return false;
+	};
+	if !target_block_matches(entry, block_number) {
+		return false;
+	}
+	let Some(mode) = FastPropFireMode::from_u8(entry.fire_mode) else {
+		return false;
+	};
+	match mode {
+		FastPropFireMode::OnAnnounce => peer_id_matches(&entry.announce_peer_id, peer),
+		FastPropFireMode::OnBlockImport | FastPropFireMode::Mixed => true,
+		FastPropFireMode::TransactMatch => false,
 	}
 }
 
-/// Mode 2: take the armed entry when a new `Ethereum.transact` matches `watch_call_addresses`.
+/// Mode 2 / 3: take the armed entry when a new `Ethereum.transact` matches `watch_call_addresses`.
 pub fn take_pool_on_mixed_transact_match(
 	call_to: &[u8; 20],
 	block_number: u64,
 ) -> Option<FastPropEntry> {
 	let mut guard = pool().write().expect("fast prop pool lock");
 	let entry = guard.as_ref()?;
-	if entry.fire_mode != FastPropFireMode::Mixed as u8 {
+	if !FastPropFireMode::from_u8(entry.fire_mode)
+		.is_some_and(|m| m.uses_transact_watch())
+	{
 		return None;
 	}
 	if !target_block_matches(entry, block_number) {
