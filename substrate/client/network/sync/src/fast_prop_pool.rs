@@ -4,7 +4,7 @@ use sc_network_types::PeerId;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// When to fire after the announce peer's best block announce at the target height.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,6 +95,12 @@ pub struct FastPropPoolView {
 	pub fire_mode: Option<u8>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub watch_call_addresses: Option<Vec<String>>,
+	/// Mode 3: transact watch active only after the announce-phase gate opens.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub transact_gate_open: Option<bool>,
+	/// Mode 3: best announce block number that opened the gate (`N-1` for target `N`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub transact_gate_at_announce: Option<u64>,
 }
 
 struct PendingImportFire {
@@ -108,6 +114,16 @@ struct PendingImportFire {
 static POOL: OnceLock<RwLock<Option<FastPropEntry>>> = OnceLock::new();
 static PENDING_IMPORT: OnceLock<RwLock<Option<PendingImportFire>>> = OnceLock::new();
 static IMPORT_BASELINE: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+static TRANSACT_GATE: OnceLock<RwLock<TransactGateState>> = OnceLock::new();
+static IMPORT_BASELINE_SNAPSHOT: OnceLock<RwLock<Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>>> =
+	OnceLock::new();
+
+/// Mode 3: mempool transact matching is enabled after this announce-phase gate opens.
+#[derive(Clone, Copy, Debug, Default)]
+struct TransactGateState {
+	open: bool,
+	opened_at_announce_number: Option<u64>,
+}
 
 fn pool() -> &'static RwLock<Option<FastPropEntry>> {
 	POOL.get_or_init(|| RwLock::new(None))
@@ -186,6 +202,118 @@ fn pending_import() -> &'static RwLock<Option<PendingImportFire>> {
 
 fn import_baseline() -> &'static RwLock<HashSet<String>> {
 	IMPORT_BASELINE.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+fn transact_gate() -> &'static RwLock<TransactGateState> {
+	TRANSACT_GATE.get_or_init(|| RwLock::new(TransactGateState::default()))
+}
+
+fn baseline_snapshot_fn() -> &'static RwLock<Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>> {
+	IMPORT_BASELINE_SNAPSHOT.get_or_init(|| RwLock::new(None))
+}
+
+fn reset_transact_gate() {
+	*transact_gate().write().expect("fast prop transact gate lock") = TransactGateState::default();
+}
+
+fn transact_gate_is_open() -> bool {
+	transact_gate().read().expect("fast prop transact gate lock").open
+}
+
+fn transact_gate_view() -> (bool, Option<u64>) {
+	let g = transact_gate().read().expect("fast prop transact gate lock");
+	(g.open, g.opened_at_announce_number)
+}
+
+/// Node registers a snapshot of ready-pool tx hashes (refreshed when mode 3 gate opens).
+pub fn register_import_baseline_snapshot(f: Arc<dyn Fn() -> Vec<String> + Send + Sync>) {
+	*baseline_snapshot_fn()
+		.write()
+		.expect("fast prop baseline snapshot lock") = Some(f);
+}
+
+fn refresh_import_baseline_from_snapshot() {
+	let snapshot = baseline_snapshot_fn()
+		.read()
+		.expect("fast prop baseline snapshot lock")
+		.clone();
+	let Some(f) = snapshot else {
+		return;
+	};
+	let hashes = f();
+	let len = hashes.len();
+	set_import_baseline(hashes);
+	log::debug!(
+		target: crate::LOG_TARGET,
+		"fast prop mode 3: refreshed import baseline with {len} ready tx(s) at gate open"
+	);
+}
+
+fn open_transact_gate_at_announce(announce_number: u64) -> bool {
+	let mut gate = transact_gate().write().expect("fast prop transact gate lock");
+	if gate.open {
+		return false;
+	}
+	gate.open = true;
+	gate.opened_at_announce_number = Some(announce_number);
+	drop(gate);
+	refresh_import_baseline_from_snapshot();
+	true
+}
+
+/// Required announce height to open the mode-3 gate for armed target `N` (`0` = first announce).
+fn transact_gate_announce_matches_target(target_block_number: u64, announce_number: u64) -> bool {
+	if target_block_number == 0 {
+		return true;
+	}
+	let parent = target_block_number.saturating_sub(1);
+	announce_number == parent
+}
+
+/// Mode 3: open gate on first best announce at `N-1` (any peer). Returns true if newly opened.
+pub fn try_open_transact_gate_on_announce(announce_number: u64) -> bool {
+	let armed = pool()
+		.read()
+		.expect("fast prop pool lock")
+		.as_ref()
+		.is_some_and(|e| FastPropFireMode::from_u8(e.fire_mode) == Some(FastPropFireMode::TransactMatch));
+	if !armed {
+		return false;
+	}
+	let target = pool()
+		.read()
+		.expect("fast prop pool lock")
+		.as_ref()
+		.map(|e| e.target_block_number)
+		.unwrap_or(0);
+	if !transact_gate_announce_matches_target(target, announce_number) {
+		return false;
+	}
+	open_transact_gate_at_announce(announce_number)
+}
+
+/// Mode 3: if local head is already at/ past `N-1`, open gate immediately after arm.
+pub fn try_open_transact_gate_at_arm(local_best: u64) {
+	let target = pool()
+		.read()
+		.expect("fast prop pool lock")
+		.as_ref()
+		.filter(|e| FastPropFireMode::from_u8(e.fire_mode) == Some(FastPropFireMode::TransactMatch))
+		.map(|e| e.target_block_number)
+		.unwrap_or(0);
+	if target == 0 {
+		return;
+	}
+	let parent = target.saturating_sub(1);
+	if local_best < parent {
+		return;
+	}
+	if open_transact_gate_at_announce(parent) {
+		log::debug!(
+			target: crate::LOG_TARGET,
+			"fast prop mode 3: transact gate opened at arm (local_best=#{local_best} target=#{target})"
+		);
+	}
 }
 
 /// Normalize an EVM call target to `0x` + 40 lowercase hex digits.
@@ -270,6 +398,7 @@ pub fn set_pool(mut entry: FastPropEntry) -> Result<(), &'static str> {
 		return Err("propagate_peer_ids must not be empty");
 	}
 	clear_pending_import();
+	reset_transact_gate();
 	if !FastPropFireMode::from_u8(entry.fire_mode)
 		.is_some_and(|m| m.uses_transact_watch())
 	{
@@ -295,22 +424,35 @@ pub fn get_pool() -> FastPropPoolView {
 			target_block_number: None,
 			fire_mode: None,
 			watch_call_addresses: None,
+			transact_gate_open: None,
+			transact_gate_at_announce: None,
 		},
-		Some(entry) => FastPropPoolView {
-			occupied: true,
-			extrinsic: Some(entry.extrinsic.clone()),
-			announce_peer_id: Some(entry.announce_peer_id.clone()),
-			propagate_peer_id: Some(entry.primary_propagate_peer_id().to_string()),
-			propagate_peer_ids: Some(entry.propagate_peer_ids.clone()),
-			peer_id: Some(entry.announce_peer_id.clone()),
-			offset_ms: Some(entry.offset_ms),
-			target_block_number: Some(entry.target_block_number),
-			fire_mode: Some(entry.fire_mode),
-			watch_call_addresses: if entry.watch_call_addresses.is_empty() {
-				None
+		Some(entry) => {
+			let mode3 = FastPropFireMode::from_u8(entry.fire_mode)
+				== Some(FastPropFireMode::TransactMatch);
+			let (gate_open, gate_at) = if mode3 {
+				transact_gate_view()
 			} else {
-				Some(entry.watch_call_addresses.clone())
-			},
+				(false, None)
+			};
+			FastPropPoolView {
+				occupied: true,
+				extrinsic: Some(entry.extrinsic.clone()),
+				announce_peer_id: Some(entry.announce_peer_id.clone()),
+				propagate_peer_id: Some(entry.primary_propagate_peer_id().to_string()),
+				propagate_peer_ids: Some(entry.propagate_peer_ids.clone()),
+				peer_id: Some(entry.announce_peer_id.clone()),
+				offset_ms: Some(entry.offset_ms),
+				target_block_number: Some(entry.target_block_number),
+				fire_mode: Some(entry.fire_mode),
+				watch_call_addresses: if entry.watch_call_addresses.is_empty() {
+					None
+				} else {
+					Some(entry.watch_call_addresses.clone())
+				},
+				transact_gate_open: mode3.then_some(gate_open),
+				transact_gate_at_announce: mode3.then(|| gate_at).flatten(),
+			}
 		},
 	}
 }
@@ -341,13 +483,23 @@ pub fn take_pool_on_mixed_transact_match(
 ) -> Option<FastPropEntry> {
 	let mut guard = pool().write().expect("fast prop pool lock");
 	let entry = guard.as_ref()?;
-	if !FastPropFireMode::from_u8(entry.fire_mode)
-		.is_some_and(|m| m.uses_transact_watch())
-	{
-		return None;
-	}
-	if !target_block_matches(entry, block_number) {
-		return None;
+	let mode = FastPropFireMode::from_u8(entry.fire_mode)?;
+	match mode {
+		FastPropFireMode::TransactMatch => {
+			if !transact_gate_is_open() {
+				return None;
+			}
+			let target = entry.target_block_number;
+			if target > 0 && block_number >= target {
+				return None;
+			}
+		},
+		FastPropFireMode::Mixed => {
+			if !target_block_matches(entry, block_number) {
+				return None;
+			}
+		},
+		_ => return None,
 	}
 	if !call_address_matches(entry, call_to) {
 		return None;
@@ -391,6 +543,7 @@ pub fn take_pool() -> Option<FastPropEntry> {
 pub fn clear_pool() {
 	*pool().write().expect("fast prop pool lock") = None;
 	clear_import_baseline();
+	reset_transact_gate();
 }
 
 /// Mode 1: hold pool entry until local import of the announced block.

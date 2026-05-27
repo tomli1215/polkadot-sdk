@@ -1,11 +1,13 @@
 //! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms, fire_mode)` when the pool
 //! trigger matches (mode 0: announce peer best announce; mode 1/2: any peer announce then
-//! local import; mode 2: or matching `Ethereum.transact`; mode 3: transact match only).
+//! local import; mode 2: or matching `Ethereum.transact` at target height; mode 3: transact match
+//! only after an announce-phase gate at `N-1`).
 
 use crate::fast_prop_pool::{
 	clear_pending_import, pool_accepts_peer_announce, set_pending_import,
 	take_pending_import_if_matches, take_pending_import_on_mixed_transact_match,
-	take_pool, take_pool_on_mixed_transact_match, FastPropEntry, FastPropFireMode,
+	take_pool, take_pool_on_mixed_transact_match, try_open_transact_gate_on_announce,
+	FastPropEntry, FastPropFireMode,
 };
 use log::debug;
 use sc_network_types::PeerId;
@@ -92,6 +94,13 @@ pub fn on_target_peer_block_announced(
 	announce_unix_ms: i64,
 	local_have_block: bool,
 ) {
+	if try_open_transact_gate_on_announce(block_number) {
+		debug!(
+			target: crate::LOG_TARGET,
+			"fast prop: mode 3 transact gate opened on best announce #{block_number} from {peer}"
+		);
+	}
+
 	if !pool_accepts_peer_announce(peer, block_number) {
 		return;
 	}
@@ -188,12 +197,17 @@ pub fn on_mixed_mode_ethereum_transact(
 		let now = chrono::Utc::now();
 		let executed_utc = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 		let executed_unix_ms = now.timestamp_millis();
+		let notify_block = if entry.target_block_number > 0 {
+			entry.target_block_number
+		} else {
+			block_number
+		};
 		debug!(
 			target: crate::LOG_TARGET,
-			"fast prop: matching Ethereum.transact in ready pool, firing (mode=mixed/transact)"
+			"fast prop: matching Ethereum.transact in ready pool, firing (mode=mixed/transact) notify_block=#{notify_block} import_best=#{block_number}"
 		);
 		let ctx = FastPropBlockContext {
-			block_number,
+			block_number: notify_block,
 			block_hash: normalize_hash(&block_hash),
 			announce_utc: executed_utc.clone(),
 			announce_unix_ms: executed_unix_ms,
