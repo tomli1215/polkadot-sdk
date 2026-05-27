@@ -120,6 +120,7 @@ static IMPORT_BASELINE_SNAPSHOT: OnceLock<RwLock<Option<Arc<dyn Fn() -> Vec<Stri
 	OnceLock::new();
 /// Ready-pool tx hashes recorded on the **first** best announce at each block height.
 static ANNOUNCE_READY_BASELINES: OnceLock<RwLock<HashMap<u64, HashSet<String>>>> = OnceLock::new();
+static GATE_OPEN_HANDLER: OnceLock<RwLock<Option<Arc<dyn Fn(u64) + Send + Sync>>>> = OnceLock::new();
 
 /// Mode 3: mempool transact matching is enabled after this announce-phase gate opens.
 #[derive(Clone, Copy, Debug, Default)]
@@ -213,6 +214,25 @@ fn transact_gate() -> &'static RwLock<TransactGateState> {
 
 fn baseline_snapshot_fn() -> &'static RwLock<Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>> {
 	IMPORT_BASELINE_SNAPSHOT.get_or_init(|| RwLock::new(None))
+}
+
+/// Register callback invoked when the mode-3 transact gate newly opens (scan ready pool).
+pub fn set_transact_gate_open_handler(handler: Arc<dyn Fn(u64) + Send + Sync>) {
+	*GATE_OPEN_HANDLER
+		.get_or_init(|| RwLock::new(None))
+		.write()
+		.expect("fast prop gate open handler lock") = Some(handler);
+}
+
+fn invoke_transact_gate_open_handler(announce_number: u64) {
+	if let Some(handler) = GATE_OPEN_HANDLER
+		.get_or_init(|| RwLock::new(None))
+		.read()
+		.expect("fast prop gate open handler lock")
+		.as_ref()
+	{
+		handler(announce_number);
+	}
 }
 
 fn announce_ready_baselines() -> &'static RwLock<HashMap<u64, HashSet<String>>> {
@@ -326,6 +346,7 @@ fn open_transact_gate_at_announce(announce_number: u64) -> bool {
 	gate.opened_at_announce_number = Some(announce_number);
 	drop(gate);
 	apply_gate_baseline_for_announce(announce_number);
+	invoke_transact_gate_open_handler(announce_number);
 	true
 }
 

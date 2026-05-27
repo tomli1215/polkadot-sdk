@@ -184,12 +184,12 @@ pub fn on_block_imported(block_number: u64, block_hash: &str) {
 	schedule_fire(entry, ctx);
 }
 
-/// Mode 2: a new `Ethereum.transact` entered the ready pool with a matching EVM `to` address.
+/// Mode 2 / 3: a matching `Ethereum.transact` in the ready pool. Returns true if the pool fired.
 pub fn on_mixed_mode_ethereum_transact(
 	call_to: [u8; 20],
 	block_number: u64,
 	block_hash: String,
-) {
+) -> bool {
 	let matched_call_address =
 		Some(crate::fast_prop_pool::normalize_call_address_bytes(&call_to));
 
@@ -218,13 +218,13 @@ pub fn on_mixed_mode_ethereum_transact(
 			matched_call_address: matched_call_address.clone(),
 		};
 		schedule_fire(entry, ctx);
-		return;
+		return true;
 	}
 
 	let Some((entry, pending_number, pending_hash, announce_utc, announce_unix_ms)) =
 		take_pending_import_on_mixed_transact_match(&call_to, block_number)
 	else {
-		return;
+		return false;
 	};
 
 	let now = chrono::Utc::now();
@@ -245,6 +245,7 @@ pub fn on_mixed_mode_ethereum_transact(
 		matched_call_address,
 	};
 	schedule_fire(entry, ctx);
+	true
 }
 
 fn schedule_fire(entry: FastPropEntry, ctx: FastPropBlockContext) {
