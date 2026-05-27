@@ -2,7 +2,7 @@
 
 use sc_network_types::PeerId;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -17,7 +17,8 @@ pub enum FastPropFireMode {
 	OnBlockImport = 1,
 	/// Fire on matching incoming `Ethereum.transact` **or** after local block import (mode 1 path).
 	Mixed = 2,
-	/// Fire only on matching incoming `Ethereum.transact` (no announce / import trigger).
+	/// Fire only on matching incoming `Ethereum.transact` after the transact gate opens at the
+	/// first best announce for `targetBlockNumber - 1` (no announce / import trigger).
 	TransactMatch = 3,
 }
 
@@ -117,6 +118,8 @@ static IMPORT_BASELINE: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 static TRANSACT_GATE: OnceLock<RwLock<TransactGateState>> = OnceLock::new();
 static IMPORT_BASELINE_SNAPSHOT: OnceLock<RwLock<Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>>> =
 	OnceLock::new();
+/// Ready-pool tx hashes recorded on the **first** best announce at each block height.
+static ANNOUNCE_READY_BASELINES: OnceLock<RwLock<HashMap<u64, HashSet<String>>>> = OnceLock::new();
 
 /// Mode 3: mempool transact matching is enabled after this announce-phase gate opens.
 #[derive(Clone, Copy, Debug, Default)]
@@ -212,6 +215,78 @@ fn baseline_snapshot_fn() -> &'static RwLock<Option<Arc<dyn Fn() -> Vec<String> 
 	IMPORT_BASELINE_SNAPSHOT.get_or_init(|| RwLock::new(None))
 }
 
+fn announce_ready_baselines() -> &'static RwLock<HashMap<u64, HashSet<String>>> {
+	ANNOUNCE_READY_BASELINES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn snapshot_ready_pool_hashes() -> Vec<String> {
+	baseline_snapshot_fn()
+		.read()
+		.expect("fast prop baseline snapshot lock")
+		.as_ref()
+		.map(|f| f())
+		.unwrap_or_default()
+}
+
+const ANNOUNCE_BASELINE_RETAIN: u64 = 64;
+
+fn prune_old_announce_baselines(current: u64) {
+	let mut map = announce_ready_baselines()
+		.write()
+		.expect("fast prop announce baseline lock");
+	if map.len() <= 128 {
+		return;
+	}
+	let floor = current.saturating_sub(ANNOUNCE_BASELINE_RETAIN);
+	map.retain(|&height, _| height >= floor);
+}
+
+/// Record ready-pool contents on the first best announce at ``announce_number`` (any fire mode).
+pub fn record_announce_ready_pool_baseline(announce_number: u64) {
+	{
+		let map = announce_ready_baselines()
+			.read()
+			.expect("fast prop announce baseline lock");
+		if map.contains_key(&announce_number) {
+			return;
+		}
+	}
+	let hashes: HashSet<String> = snapshot_ready_pool_hashes().into_iter().collect();
+	let len = hashes.len();
+	{
+		let mut map = announce_ready_baselines()
+			.write()
+			.expect("fast prop announce baseline lock");
+		if map.contains_key(&announce_number) {
+			return;
+		}
+		map.insert(announce_number, hashes);
+	}
+	prune_old_announce_baselines(announce_number);
+	log::debug!(
+		target: crate::LOG_TARGET,
+		"fast prop: recorded announce baseline {len} ready tx(s) at best announce #{announce_number}"
+	);
+}
+
+fn apply_gate_baseline_for_announce(announce_number: u64) {
+	if let Some(hashes) = announce_ready_baselines()
+		.read()
+		.expect("fast prop announce baseline lock")
+		.get(&announce_number)
+		.cloned()
+	{
+		let len = hashes.len();
+		set_import_baseline(hashes);
+		log::debug!(
+			target: crate::LOG_TARGET,
+			"fast prop mode 3: gate baseline {len} ready tx(s) from announce #{announce_number} snapshot"
+		);
+		return;
+	}
+	refresh_import_baseline_from_snapshot();
+}
+
 fn reset_transact_gate() {
 	*transact_gate().write().expect("fast prop transact gate lock") = TransactGateState::default();
 }
@@ -233,14 +308,7 @@ pub fn register_import_baseline_snapshot(f: Arc<dyn Fn() -> Vec<String> + Send +
 }
 
 fn refresh_import_baseline_from_snapshot() {
-	let snapshot = baseline_snapshot_fn()
-		.read()
-		.expect("fast prop baseline snapshot lock")
-		.clone();
-	let Some(f) = snapshot else {
-		return;
-	};
-	let hashes = f();
+	let hashes = snapshot_ready_pool_hashes();
 	let len = hashes.len();
 	set_import_baseline(hashes);
 	log::debug!(
@@ -257,7 +325,7 @@ fn open_transact_gate_at_announce(announce_number: u64) -> bool {
 	gate.open = true;
 	gate.opened_at_announce_number = Some(announce_number);
 	drop(gate);
-	refresh_import_baseline_from_snapshot();
+	apply_gate_baseline_for_announce(announce_number);
 	true
 }
 

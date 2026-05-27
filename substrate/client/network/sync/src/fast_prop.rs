@@ -1,13 +1,13 @@
 //! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms, fire_mode)` when the pool
 //! trigger matches (mode 0: announce peer best announce; mode 1/2: any peer announce then
 //! local import; mode 2: or matching `Ethereum.transact` at target height; mode 3: transact match
-//! only after an announce-phase gate at `N-1`).
+//! only after the first best announce at `N-1` opens the gate (baseline = ready pool at that announce).
 
 use crate::fast_prop_pool::{
-	clear_pending_import, pool_accepts_peer_announce, set_pending_import,
-	take_pending_import_if_matches, take_pending_import_on_mixed_transact_match,
-	take_pool, take_pool_on_mixed_transact_match, try_open_transact_gate_on_announce,
-	FastPropEntry, FastPropFireMode,
+	clear_pending_import, pool_accepts_peer_announce, record_announce_ready_pool_baseline,
+	set_pending_import, take_pending_import_if_matches,
+	take_pending_import_on_mixed_transact_match, take_pool, take_pool_on_mixed_transact_match,
+	try_open_transact_gate_on_announce, FastPropEntry, FastPropFireMode,
 };
 use log::debug;
 use sc_network_types::PeerId;
@@ -94,6 +94,7 @@ pub fn on_target_peer_block_announced(
 	announce_unix_ms: i64,
 	local_have_block: bool,
 ) {
+	record_announce_ready_pool_baseline(block_number);
 	if try_open_transact_gate_on_announce(block_number) {
 		debug!(
 			target: crate::LOG_TARGET,
