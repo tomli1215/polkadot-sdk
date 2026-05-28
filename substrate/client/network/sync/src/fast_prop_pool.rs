@@ -17,8 +17,9 @@ pub enum FastPropFireMode {
 	OnBlockImport = 1,
 	/// Fire on matching incoming `Ethereum.transact` **or** after local block import (mode 1 path).
 	Mixed = 2,
-	/// Fire only on matching incoming `Ethereum.transact` after the transact gate opens at the
-	/// first best announce for `targetBlockNumber - 1` (no announce / import trigger).
+	/// Fire on matching incoming `Ethereum.transact` after the transact gate opens at the
+	/// first best announce for `targetBlockNumber - 1`, or `offset_ms` after local import of
+	/// `N-1` if no matching transact arrived (import fallback).
 	TransactMatch = 3,
 }
 
@@ -121,6 +122,70 @@ static IMPORT_BASELINE_SNAPSHOT: OnceLock<RwLock<Option<Arc<dyn Fn() -> Vec<Stri
 /// Ready-pool tx hashes recorded on the **first** best announce at each block height.
 static ANNOUNCE_READY_BASELINES: OnceLock<RwLock<HashMap<u64, HashSet<String>>>> = OnceLock::new();
 static GATE_OPEN_HANDLER: OnceLock<RwLock<Option<Arc<dyn Fn(u64) + Send + Sync>>>> = OnceLock::new();
+static MODE3_FALLBACK_GEN: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+
+fn mode3_fallback_gen() -> &'static std::sync::atomic::AtomicU64 {
+	MODE3_FALLBACK_GEN.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Cancel any in-flight mode-3 import-fallback sleep task.
+pub fn cancel_mode3_import_fallback() {
+	mode3_fallback_gen().fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Cancel prior fallback tasks and return the generation token for a new one.
+pub fn mode3_import_fallback_generation() -> u64 {
+	mode3_fallback_gen().fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+pub fn mode3_import_fallback_generation_active(expected: u64) -> bool {
+	mode3_fallback_gen().load(std::sync::atomic::Ordering::Acquire) == expected
+}
+
+fn mode3_parent_block_number(target: u64) -> Option<u64> {
+	if target == 0 {
+		None
+	} else {
+		Some(target.saturating_sub(1))
+	}
+}
+
+/// Gate open + local import of `N-1` → start import-fallback timer (`offset_ms`, target `N`).
+pub fn mode3_import_fallback_params(imported_number: u64) -> Option<(u64, u64)> {
+	let entry = pool().read().expect("fast prop pool lock").as_ref()?.clone();
+	if FastPropFireMode::from_u8(entry.fire_mode) != Some(FastPropFireMode::TransactMatch) {
+		return None;
+	}
+	if !transact_gate_is_open() {
+		return None;
+	}
+	let target = entry.target_block_number;
+	let parent = mode3_parent_block_number(target)?;
+	if imported_number != parent {
+		return None;
+	}
+	Some((entry.offset_ms, target))
+}
+
+/// Take the armed pool entry for mode-3 import fallback at fire time.
+pub fn take_pool_on_mode3_import_fallback(expected_target: u64) -> Option<FastPropEntry> {
+	let mut guard = pool().write().expect("fast prop pool lock");
+	let entry = guard.as_ref()?;
+	if FastPropFireMode::from_u8(entry.fire_mode) != Some(FastPropFireMode::TransactMatch) {
+		return None;
+	}
+	if entry.target_block_number != expected_target {
+		return None;
+	}
+	if !transact_gate_is_open() {
+		return None;
+	}
+	let entry = guard.take()?;
+	cancel_mode3_import_fallback();
+	clear_import_baseline();
+	reset_transact_gate();
+	Some(entry)
+}
 
 /// Mode 3: mempool transact matching is enabled after this announce-phase gate opens.
 #[derive(Clone, Copy, Debug, Default)]
@@ -487,6 +552,7 @@ pub fn set_pool(mut entry: FastPropEntry) -> Result<(), &'static str> {
 		return Err("propagate_peer_ids must not be empty");
 	}
 	clear_pending_import();
+	cancel_mode3_import_fallback();
 	reset_transact_gate();
 	if !FastPropFireMode::from_u8(entry.fire_mode)
 		.is_some_and(|m| m.uses_transact_watch())
@@ -593,6 +659,7 @@ pub fn take_pool_on_mixed_transact_match(
 	if !call_address_matches(entry, call_to) {
 		return None;
 	}
+	cancel_mode3_import_fallback();
 	guard.take()
 }
 
@@ -631,6 +698,7 @@ pub fn take_pool() -> Option<FastPropEntry> {
 /// Clear the pool (e.g. after a failed fire).
 pub fn clear_pool() {
 	*pool().write().expect("fast prop pool lock") = None;
+	cancel_mode3_import_fallback();
 	clear_import_baseline();
 	reset_transact_gate();
 }

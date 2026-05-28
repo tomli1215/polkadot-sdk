@@ -1,12 +1,15 @@
 //! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms, fire_mode)` when the pool
 //! trigger matches (mode 0: announce peer best announce; mode 1/2: any peer announce then
 //! local import; mode 2: or matching `Ethereum.transact` at target height; mode 3: transact match
-//! only after the first best announce at `N-1` opens the gate (baseline = ready pool at that announce).
+//! after the first best announce at `N-1` opens the gate, or import fallback `offset_ms` after
+//! local import of `N-1` when no matching transact arrived).
 
 use crate::fast_prop_pool::{
-	clear_pending_import, pool_accepts_peer_announce, record_announce_ready_pool_baseline,
-	set_pending_import, take_pending_import_if_matches,
-	take_pending_import_on_mixed_transact_match, take_pool, take_pool_on_mixed_transact_match,
+	cancel_mode3_import_fallback, clear_pending_import, mode3_import_fallback_generation,
+	mode3_import_fallback_generation_active, mode3_import_fallback_params,
+	pool_accepts_peer_announce, record_announce_ready_pool_baseline, set_pending_import,
+	take_pending_import_if_matches, take_pending_import_on_mixed_transact_match, take_pool,
+	take_pool_on_mode3_import_fallback, take_pool_on_mixed_transact_match,
 	try_open_transact_gate_on_announce, FastPropEntry, FastPropFireMode,
 };
 use log::debug;
@@ -23,6 +26,8 @@ pub enum FastPropFireTrigger {
 	BlockImport,
 	/// Mode 2: new `Ethereum.transact` with EVM `to` in `watch_call_addresses`.
 	TransactMatch,
+	/// Mode 3: no matching transact within `offset_ms` after local import of `N-1`.
+	ImportFallback,
 }
 
 impl FastPropFireTrigger {
@@ -31,12 +36,13 @@ impl FastPropFireTrigger {
 			Self::OnAnnounce => "onAnnounce",
 			Self::BlockImport => "blockImport",
 			Self::TransactMatch => "transactMatch",
+			Self::ImportFallback => "importFallback",
 		}
 	}
 
-	/// Mode 2 transact match fires immediately; import/announce honor `offset_ms`.
+	/// Transact match fires immediately; import fallback already waited `offset_ms`.
 	pub fn applies_offset_ms(self) -> bool {
-		!matches!(self, Self::TransactMatch)
+		matches!(self, Self::OnAnnounce | Self::BlockImport)
 	}
 }
 
@@ -155,6 +161,8 @@ pub fn on_target_peer_block_announced(
 /// Local block import finished: fire in mode 1 when it matches pending pool peer announce.
 pub fn on_block_imported(block_number: u64, block_hash: &str) {
 	let hash_norm = normalize_hash(block_hash);
+	maybe_schedule_mode3_import_fallback(block_number, hash_norm.clone());
+
 	let Some((entry, _pending_number, _pending_hash, announce_utc, announce_unix_ms)) =
 		take_pending_import_if_matches(block_number, &hash_norm)
 	else {
@@ -194,6 +202,7 @@ pub fn on_mixed_mode_ethereum_transact(
 		Some(crate::fast_prop_pool::normalize_call_address_bytes(&call_to));
 
 	if let Some(entry) = take_pool_on_mixed_transact_match(&call_to, block_number) {
+		cancel_mode3_import_fallback();
 		clear_pending_import();
 		let now = chrono::Utc::now();
 		let executed_utc = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -246,6 +255,51 @@ pub fn on_mixed_mode_ethereum_transact(
 	};
 	schedule_fire(entry, ctx);
 	true
+}
+
+/// Mode 3: schedule import fallback on local import of `N-1` when the gate is already open.
+fn maybe_schedule_mode3_import_fallback(imported_number: u64, block_hash: String) {
+	let Some((offset_ms, target)) = mode3_import_fallback_params(imported_number) else {
+		return;
+	};
+
+	let generation = mode3_import_fallback_generation();
+	let parent = imported_number;
+
+	debug!(
+		target: crate::LOG_TARGET,
+		"fast prop mode 3: scheduling import fallback in {offset_ms}ms after local import #{parent} (target=#{target})"
+	);
+
+	tokio::spawn(async move {
+		if offset_ms > 0 {
+			tokio::time::sleep(Duration::from_millis(offset_ms)).await;
+		}
+		if !mode3_import_fallback_generation_active(generation) {
+			return;
+		}
+		let Some(entry) = take_pool_on_mode3_import_fallback(target) else {
+			return;
+		};
+		let import_time = chrono::Utc::now();
+		let executed_utc = import_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+		let executed_unix_ms = import_time.timestamp_millis();
+		debug!(
+			target: crate::LOG_TARGET,
+			"fast prop mode 3: import fallback firing for target #{target} (no matching transact within {offset_ms}ms of local import #{parent})"
+		);
+		let ctx = FastPropBlockContext {
+			block_number: parent,
+			block_hash,
+			announce_utc: executed_utc.clone(),
+			announce_unix_ms: executed_unix_ms,
+			executed_utc,
+			executed_unix_ms,
+			trigger: FastPropFireTrigger::ImportFallback,
+			matched_call_address: None,
+		};
+		schedule_fire(entry, ctx);
+	});
 }
 
 fn schedule_fire(entry: FastPropEntry, ctx: FastPropBlockContext) {
