@@ -540,7 +540,16 @@ where
 			.or_else(|| self.block_announce_data_cache.get(&hash).cloned())
 			.unwrap_or_default();
 
+		let block_number: u64 = (*header.number()).unique_saturated_into();
+
 		for (peer_id, ref mut peer) in self.peers.iter_mut() {
+			if crate::suppress_reannounce::should_suppress_reannounce(peer_id, block_number) {
+				log::trace!(
+					target: LOG_TARGET,
+					"Skipping reannounce block #{block_number} {hash:?} to {peer_id} (suppress by slot)",
+				);
+				continue;
+			}
 			let inserted = peer.known_blocks.insert(hash);
 			if inserted {
 				log::trace!(target: LOG_TARGET, "Announcing block {hash:?} to {peer_id}");

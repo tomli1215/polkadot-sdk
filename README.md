@@ -25,6 +25,7 @@ Fork: [tomli1215/polkadot-sdk](https://github.com/tomli1215/polkadot-sdk) (from 
 
 - `block_announce_notify` — in-process broadcast for RPC subscribers (no `block_announces.log` / file logging)
 - `engine.rs` calls `publish_block_announce_received` when a `/block-announces/1` message is decoded
+- `suppress_reannounce.rs` — optional slot-based outbound re-announce blacklist (see env below)
 
 **Current tip for Subtensor:** `bc5a0c573aa154ea373b327953723d185a34ecbf` — set this as `rev` in [tomli1215/subtensor](https://github.com/tomli1215/subtensor) `Cargo.toml` after pushing this branch.
 

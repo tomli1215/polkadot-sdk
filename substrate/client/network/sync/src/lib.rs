@@ -27,6 +27,7 @@ pub mod block_announce_notify;
 pub mod fast_prop;
 pub mod fast_prop_notify;
 pub mod fast_prop_pool;
+mod suppress_reannounce;
 mod block_announce_validator;
 mod futures_stream;
 mod justification_requests;
