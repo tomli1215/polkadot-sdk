@@ -3,14 +3,18 @@
 //! local import; mode 2: or matching `Ethereum.transact` at target height; mode 3: transact match
 //! after the first best announce at `N-1` opens the gate, or import fallback `offset_ms` after
 //! local import of `N-1` when no matching transact arrived).
+//!
+//! When `SYNC_SUPPRESS_REANNOUNCE_BY_SLOT` maps slot `N % modulus` for armed target `N`, all modes
+//! are overridden: fire on that authority's best announce at `#(N-1)` with propagate to that peer.
 
 use crate::fast_prop_pool::{
 	cancel_mode3_import_fallback, clear_pending_import, mode3_import_fallback_generation,
 	mode3_import_fallback_generation_active, mode3_import_fallback_params,
 	pool_accepts_peer_announce, record_announce_ready_pool_baseline, set_pending_import,
-	take_pending_import_if_matches, take_pending_import_on_mixed_transact_match, take_pool,
-	take_pool_on_mode3_import_fallback, take_pool_on_mixed_transact_match,
-	try_open_transact_gate_on_announce, FastPropEntry, FastPropFireMode,
+	take_pending_import_if_matches, take_pending_import_on_mixed_transact_match,
+	take_pool, take_pool_on_authority_slot_announce, take_pool_on_mode3_import_fallback,
+	take_pool_on_mixed_transact_match, try_open_transact_gate_on_announce, FastPropEntry,
+	FastPropFireMode,
 };
 use log::debug;
 use sc_network_types::PeerId;
@@ -28,6 +32,8 @@ pub enum FastPropFireTrigger {
 	TransactMatch,
 	/// Mode 3: no matching transact within `offset_ms` after local import of `N-1`.
 	ImportFallback,
+	/// Authority slot override: best announce at `N-1` from the slot authority for target `N`.
+	AuthoritySlotAnnounce,
 }
 
 impl FastPropFireTrigger {
@@ -37,12 +43,13 @@ impl FastPropFireTrigger {
 			Self::BlockImport => "blockImport",
 			Self::TransactMatch => "transactMatch",
 			Self::ImportFallback => "importFallback",
+			Self::AuthoritySlotAnnounce => "authoritySlotAnnounce",
 		}
 	}
 
 	/// Transact match fires immediately; import fallback already waited `offset_ms`.
 	pub fn applies_offset_ms(self) -> bool {
-		matches!(self, Self::OnAnnounce | Self::BlockImport)
+		matches!(self, Self::OnAnnounce | Self::BlockImport | Self::AuthoritySlotAnnounce)
 	}
 }
 
@@ -101,6 +108,15 @@ pub fn on_target_peer_block_announced(
 	local_have_block: bool,
 ) {
 	record_announce_ready_pool_baseline(block_number);
+	if try_fire_authority_slot_override(
+		peer,
+		block_number,
+		&block_hash,
+		&announce_utc,
+		announce_unix_ms,
+	) {
+		return;
+	}
 	if try_open_transact_gate_on_announce(block_number) {
 		debug!(
 			target: crate::LOG_TARGET,
@@ -156,6 +172,35 @@ pub fn on_target_peer_block_announced(
 	};
 
 	schedule_fire(entry, ctx);
+}
+
+fn try_fire_authority_slot_override(
+	peer: &PeerId,
+	block_number: u64,
+	block_hash: &str,
+	announce_utc: &str,
+	announce_unix_ms: i64,
+) -> bool {
+	let Some(entry) = take_pool_on_authority_slot_announce(peer, block_number) else {
+		return false;
+	};
+	debug!(
+		target: crate::LOG_TARGET,
+		"fast prop: authority slot best announce #{block_number} from {peer}, firing (target=#{})",
+		entry.target_block_number,
+	);
+	let ctx = FastPropBlockContext {
+		block_number,
+		block_hash: normalize_hash(block_hash),
+		announce_utc: announce_utc.to_string(),
+		announce_unix_ms,
+		executed_utc: announce_utc.to_string(),
+		executed_unix_ms: announce_unix_ms,
+		trigger: FastPropFireTrigger::AuthoritySlotAnnounce,
+		matched_call_address: None,
+	};
+	schedule_fire(entry, ctx);
+	true
 }
 
 /// Local block import finished: fire in mode 1 when it matches pending pool peer announce.

@@ -18,7 +18,7 @@ pub struct FastPropFiredNotification {
 	pub offset_ms: u64,
 	/// Delay actually applied for this fire (`0` for mode-2 `transactMatch`).
 	pub offset_applied_ms: u64,
-	/// What invoked the fire: `onAnnounce`, `blockImport`, or `transactMatch`.
+	/// What invoked the fire: `onAnnounce`, `blockImport`, `transactMatch`, `authoritySlotAnnounce`, etc.
 	pub fire_trigger: String,
 	/// EVM `to` when `fire_trigger` is `transactMatch`.
 	#[serde(skip_serializing_if = "Option::is_none")]

@@ -59,6 +59,22 @@ fn config() -> &'static Config {
 	CONFIG.get_or_init(load_config)
 }
 
+/// Authority peer configured for `block_number % modulus` (producer slot for block `#N`).
+pub fn authority_peer_for_block(block_number: u64) -> Option<PeerId> {
+	let cfg = config();
+	if cfg.by_slot.is_empty() {
+		return None;
+	}
+	let slot = block_number % cfg.modulus;
+	authority_peer_for_slot_index(slot)
+}
+
+fn authority_peer_for_slot_index(slot: u64) -> Option<PeerId> {
+	let cfg = config();
+	let idx = slot as usize;
+	cfg.by_slot.get(idx).and_then(|p| p.clone())
+}
+
 /// True when this node should **not** send an outbound block announce for `block_number`
 /// to `peer` (so the peer is not told we already know the block).
 pub fn should_suppress_reannounce(peer: &PeerId, block_number: u64) -> bool {
@@ -67,11 +83,10 @@ pub fn should_suppress_reannounce(peer: &PeerId, block_number: u64) -> bool {
 		return false;
 	}
 	let slot = block_number % cfg.modulus;
-	let idx = slot as usize;
-	let Some(suppressed) = cfg.by_slot.get(idx).and_then(|p| p.as_ref()) else {
+	let Some(suppressed) = authority_peer_for_slot_index(slot) else {
 		return false;
 	};
-	suppressed == peer
+	suppressed == *peer
 }
 
 #[cfg(test)]
@@ -94,10 +109,31 @@ mod tests {
 	}
 
 	fn slot_matches(cfg: &Config, peer: &PeerId, block_number: u64) -> bool {
+		slot_authority(cfg, block_number).as_ref() == Some(peer)
+	}
+
+	#[test]
+	fn authority_peer_for_block_slot() {
+		let peer_a = PeerId::from_str("12D3KooWK1g872Z4BkiMMiyV8eEk47MLkxbMk23GB5JgVrH6fv3g").unwrap();
+		let cfg = Config {
+			modulus: 20,
+			by_slot: {
+				let mut v = vec![None; 20];
+				v[15] = Some(peer_a.clone());
+				v
+			},
+		};
+		assert_eq!(
+			slot_authority(&cfg, 8335435).as_ref(),
+			Some(&peer_a)
+		);
+		assert!(slot_authority(&cfg, 8335436).is_none());
+	}
+
+	fn slot_authority(cfg: &Config, block_number: u64) -> Option<PeerId> {
 		let slot = block_number % cfg.modulus;
 		cfg.by_slot
 			.get(slot as usize)
-			.and_then(|p| p.as_ref())
-			.map_or(false, |p| p == peer)
+			.and_then(|p| p.clone())
 	}
 }

@@ -103,6 +103,11 @@ pub struct FastPropPoolView {
 	/// Mode 3: best announce block number that opened the gate (`N-1` for target `N`).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub transact_gate_at_announce: Option<u64>,
+	/// When set, configured fire mode is ignored: wait for this peer's best announce at `authority_slot_wait_announce`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub authority_slot_peer: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub authority_slot_wait_announce: Option<u64>,
 }
 
 struct PendingImportFire {
@@ -153,6 +158,9 @@ fn mode3_parent_block_number(target: u64) -> Option<u64> {
 /// Gate open + local import of `N-1` → start import-fallback timer (`offset_ms`, target `N`).
 pub fn mode3_import_fallback_params(imported_number: u64) -> Option<(u64, u64)> {
 	let entry = pool().read().expect("fast prop pool lock").as_ref()?.clone();
+	if authority_slot_override_for_entry(&entry).is_some() {
+		return None;
+	}
 	if FastPropFireMode::from_u8(entry.fire_mode) != Some(FastPropFireMode::TransactMatch) {
 		return None;
 	}
@@ -426,6 +434,9 @@ fn transact_gate_announce_matches_target(target_block_number: u64, announce_numb
 
 /// Mode 3: open gate on first best announce at `N-1` (any peer). Returns true if newly opened.
 pub fn try_open_transact_gate_on_announce(announce_number: u64) -> bool {
+	if authority_slot_override_armed() {
+		return false;
+	}
 	let armed = pool()
 		.read()
 		.expect("fast prop pool lock")
@@ -448,6 +459,9 @@ pub fn try_open_transact_gate_on_announce(announce_number: u64) -> bool {
 
 /// Mode 3: if local head is already at/ past `N-1`, open gate immediately after arm.
 pub fn try_open_transact_gate_at_arm(local_best: u64) {
+	if authority_slot_override_armed() {
+		return;
+	}
 	let target = pool()
 		.read()
 		.expect("fast prop pool lock")
@@ -503,6 +517,59 @@ fn peer_id_matches(expected: &str, actual: &PeerId) -> bool {
 	!expected.is_empty() && actual.to_string() == expected
 }
 
+/// When armed for target `N` and `SYNC_SUPPRESS_REANNOUNCE_BY_SLOT` maps slot `N % modulus`,
+/// fire on the authority peer's best announce at `#(N-1)` instead of the configured `fire_mode`.
+fn authority_slot_override_for_entry(entry: &FastPropEntry) -> Option<(PeerId, u64)> {
+	let target = entry.target_block_number;
+	if target == 0 {
+		return None;
+	}
+	let authority = crate::suppress_reannounce::authority_peer_for_block(target)?;
+	let parent = target.saturating_sub(1);
+	Some((authority, parent))
+}
+
+/// True when the armed pool uses authority-slot override (any configured `fire_mode` is ignored).
+pub fn authority_slot_override_armed() -> bool {
+	pool()
+		.read()
+		.expect("fast prop pool lock")
+		.as_ref()
+		.is_some_and(|e| authority_slot_override_for_entry(e).is_some())
+}
+
+fn authority_slot_view(entry: &FastPropEntry) -> (Option<String>, Option<u64>) {
+	authority_slot_override_for_entry(entry).map_or((None, None), |(peer, parent)| {
+		(Some(peer.to_string()), Some(parent))
+	})
+}
+
+fn prepare_authority_slot_fire(entry: &mut FastPropEntry, authority: &PeerId) {
+	let auth = authority.to_string();
+	entry.announce_peer_id = auth.clone();
+	entry.propagate_peer_ids = vec![auth];
+}
+
+/// Take the armed entry when `peer` best-announces `parent` and `parent == target - 1` for the
+/// authority configured at slot `target % modulus`.
+pub fn take_pool_on_authority_slot_announce(
+	peer: &PeerId,
+	block_number: u64,
+) -> Option<FastPropEntry> {
+	let mut guard = pool().write().expect("fast prop pool lock");
+	let entry = guard.as_ref()?;
+	let (authority, parent) = authority_slot_override_for_entry(entry)?;
+	if block_number != parent || peer != &authority {
+		return None;
+	}
+	let mut entry = guard.take()?;
+	prepare_authority_slot_fire(&mut entry, &authority);
+	cancel_mode3_import_fallback();
+	clear_import_baseline();
+	reset_transact_gate();
+	Some(entry)
+}
+
 /// Snapshot ready-pool tx hashes already present when mode 2 is armed (not fired on these).
 pub fn set_import_baseline(hashes: impl IntoIterator<Item = String>) {
 	let mut guard = import_baseline().write().expect("fast prop baseline lock");
@@ -522,6 +589,9 @@ pub fn is_import_baseline_hash(hash: &str) -> bool {
 
 /// Mode 2 / 3: watch ready pool for matching `Ethereum.transact`.
 pub fn transact_watch_mode_active() -> bool {
+	if authority_slot_override_armed() {
+		return false;
+	}
 	let pool_armed = pool()
 		.read()
 		.expect("fast prop pool lock")
@@ -581,15 +651,18 @@ pub fn get_pool() -> FastPropPoolView {
 			watch_call_addresses: None,
 			transact_gate_open: None,
 			transact_gate_at_announce: None,
+			authority_slot_peer: None,
+			authority_slot_wait_announce: None,
 		},
 		Some(entry) => {
 			let mode3 = FastPropFireMode::from_u8(entry.fire_mode)
 				== Some(FastPropFireMode::TransactMatch);
-			let (gate_open, gate_at) = if mode3 {
+			let (gate_open, gate_at) = if mode3 && !authority_slot_override_for_entry(entry).is_some() {
 				transact_gate_view()
 			} else {
 				(false, None)
 			};
+			let (auth_peer, auth_wait) = authority_slot_view(entry);
 			FastPropPoolView {
 				occupied: true,
 				extrinsic: Some(entry.extrinsic.clone()),
@@ -607,6 +680,8 @@ pub fn get_pool() -> FastPropPoolView {
 				},
 				transact_gate_open: mode3.then_some(gate_open),
 				transact_gate_at_announce: mode3.then(|| gate_at).flatten(),
+				authority_slot_peer: auth_peer,
+				authority_slot_wait_announce: auth_wait,
 			}
 		},
 	}
@@ -618,6 +693,9 @@ pub fn pool_accepts_peer_announce(peer: &PeerId, block_number: u64) -> bool {
 	let Some(entry) = guard.as_ref() else {
 		return false;
 	};
+	if authority_slot_override_for_entry(entry).is_some() {
+		return false;
+	}
 	if !target_block_matches(entry, block_number) {
 		return false;
 	}
@@ -638,6 +716,9 @@ pub fn take_pool_on_mixed_transact_match(
 ) -> Option<FastPropEntry> {
 	let mut guard = pool().write().expect("fast prop pool lock");
 	let entry = guard.as_ref()?;
+	if authority_slot_override_for_entry(entry).is_some() {
+		return None;
+	}
 	let mode = FastPropFireMode::from_u8(entry.fire_mode)?;
 	match mode {
 		FastPropFireMode::TransactMatch => {
