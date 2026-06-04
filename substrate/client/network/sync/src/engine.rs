@@ -819,6 +819,7 @@ where
 				let announce_time = Utc::now();
 				let announce_utc = announce_time.to_rfc3339_opts(SecondsFormat::Millis, true);
 				let announce_unix_ms = announce_time.timestamp_millis();
+				let local_best: u64 = self.client.info().best_number.unique_saturated_into();
 				publish_block_announce_received(
 					&peer,
 					number,
@@ -836,6 +837,7 @@ where
 						announce_utc,
 						announce_unix_ms,
 						have_block,
+						local_best,
 					);
 				}
 

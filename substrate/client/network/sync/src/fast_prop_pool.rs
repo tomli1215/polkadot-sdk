@@ -128,6 +128,25 @@ static IMPORT_BASELINE_SNAPSHOT: OnceLock<RwLock<Option<Arc<dyn Fn() -> Vec<Stri
 static ANNOUNCE_READY_BASELINES: OnceLock<RwLock<HashMap<u64, HashSet<String>>>> = OnceLock::new();
 static GATE_OPEN_HANDLER: OnceLock<RwLock<Option<Arc<dyn Fn(u64) + Send + Sync>>>> = OnceLock::new();
 static MODE3_FALLBACK_GEN: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+static PENDING_AUTHORITY_SLOT: OnceLock<RwLock<Option<PendingAuthoritySlotAnnounce>>> =
+	OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct PendingAuthoritySlotAnnounce {
+	block_hash: String,
+	announce_utc: String,
+	announce_unix_ms: i64,
+}
+
+fn pending_authority_slot() -> &'static RwLock<Option<PendingAuthoritySlotAnnounce>> {
+	PENDING_AUTHORITY_SLOT.get_or_init(|| RwLock::new(None))
+}
+
+fn clear_pending_authority_slot() {
+	*pending_authority_slot()
+		.write()
+		.expect("fast prop pending authority lock") = None;
+}
 
 fn mode3_fallback_gen() -> &'static std::sync::atomic::AtomicU64 {
 	MODE3_FALLBACK_GEN.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
@@ -517,14 +536,15 @@ fn peer_id_matches(expected: &str, actual: &PeerId) -> bool {
 	!expected.is_empty() && actual.to_string() == expected
 }
 
-/// When armed for target `N` and `SYNC_SUPPRESS_REANNOUNCE_BY_SLOT` maps slot `N % modulus`,
-/// fire on the authority peer's best announce at `#(N-1)` instead of the configured `fire_mode`.
+/// When armed for landing block `N`, list index `(N - 1) % modulus` names the producer of `#N`.
+/// Wait for that peer's best announce at `#(N - 1)` (e.g. landing `#8336048` → JTQr at index 7
+/// announces `#8336047`), then fire to that peer.
 fn authority_slot_override_for_entry(entry: &FastPropEntry) -> Option<(PeerId, u64)> {
 	let target = entry.target_block_number;
 	if target == 0 {
 		return None;
 	}
-	let authority = crate::suppress_reannounce::authority_peer_for_block(target)?;
+	let authority = crate::suppress_reannounce::authority_peer_for_landing_block(target)?;
 	let parent = target.saturating_sub(1);
 	Some((authority, parent))
 }
@@ -550,24 +570,75 @@ fn prepare_authority_slot_fire(entry: &mut FastPropEntry, authority: &PeerId) {
 	entry.propagate_peer_ids = vec![auth];
 }
 
-/// Take the armed entry when `peer` best-announces `parent` and `parent == target - 1` for the
-/// authority configured at slot `target % modulus`.
-pub fn take_pool_on_authority_slot_announce(
-	peer: &PeerId,
-	block_number: u64,
-) -> Option<FastPropEntry> {
+fn take_pool_on_authority_slot_match() -> Option<FastPropEntry> {
 	let mut guard = pool().write().expect("fast prop pool lock");
 	let entry = guard.as_ref()?;
-	let (authority, parent) = authority_slot_override_for_entry(entry)?;
-	if block_number != parent || peer != &authority {
-		return None;
-	}
+	let (authority, _parent) = authority_slot_override_for_entry(entry)?;
 	let mut entry = guard.take()?;
 	prepare_authority_slot_fire(&mut entry, &authority);
 	cancel_mode3_import_fallback();
 	clear_import_baseline();
 	reset_transact_gate();
+	clear_pending_authority_slot();
 	Some(entry)
+}
+
+/// Best announce from the slot authority at `#(N-1)`; defer until local head ≥ `#(N-1)`.
+pub fn try_authority_slot_announce_fire(
+	peer: &PeerId,
+	block_number: u64,
+	block_hash: String,
+	announce_utc: String,
+	announce_unix_ms: i64,
+	local_best: u64,
+) -> Option<FastPropEntry> {
+	let guard = pool().read().expect("fast prop pool lock");
+	let entry = guard.as_ref()?;
+	let (authority, parent) = authority_slot_override_for_entry(entry)?;
+	if block_number != parent || peer != &authority {
+		return None;
+	}
+	if local_best < parent {
+		*pending_authority_slot()
+			.write()
+			.expect("fast prop pending authority lock") = Some(PendingAuthoritySlotAnnounce {
+			block_hash,
+			announce_utc,
+			announce_unix_ms,
+		});
+		log::debug!(
+			target: crate::LOG_TARGET,
+			"fast prop: authority slot announce #{block_number} from {peer} deferred until local head ≥ #{parent} (head=#{local_best})"
+		);
+		return None;
+	}
+	drop(guard);
+	take_pool_on_authority_slot_match()
+}
+
+/// Fire after local import of `#(N-1)` if the authority announce arrived while head was still `#(N-2)`.
+pub fn try_authority_slot_import_fire(
+	imported_block: u64,
+) -> Option<(FastPropEntry, u64, String, String, i64)> {
+	let pending = pending_authority_slot()
+		.read()
+		.expect("fast prop pending authority lock")
+		.clone()?;
+	let guard = pool().read().expect("fast prop pool lock");
+	let entry = guard.as_ref()?;
+	let (_authority, parent) = authority_slot_override_for_entry(entry)?;
+	if imported_block != parent {
+		return None;
+	}
+	drop(guard);
+	let entry = take_pool_on_authority_slot_match()?;
+	Some((
+		entry,
+		parent,
+		pending.block_hash,
+		pending.announce_utc,
+		pending.announce_unix_ms,
+	))
 }
 
 /// Snapshot ready-pool tx hashes already present when mode 2 is armed (not fired on these).
@@ -624,6 +695,7 @@ pub fn set_pool(mut entry: FastPropEntry) -> Result<(), &'static str> {
 	clear_pending_import();
 	cancel_mode3_import_fallback();
 	reset_transact_gate();
+	clear_pending_authority_slot();
 	if !FastPropFireMode::from_u8(entry.fire_mode)
 		.is_some_and(|m| m.uses_transact_watch())
 	{
