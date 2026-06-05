@@ -1,6 +1,5 @@
 //! In-process broadcast of fast-propagation events for RPC subscribers.
 
-use chrono::Utc;
 use futures::channel::mpsc;
 use futures::Stream;
 use serde::Serialize;
@@ -10,7 +9,7 @@ use std::sync::{OnceLock, RwLock};
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FastPropFiredNotification {
-	/// RFC3339 UTC when fast-prop fired (immediately before P2P propagate).
+	/// RFC3339 UTC when fast-prop fired (trigger time; may precede P2P propagate).
 	pub utc: String,
 	/// RFC3339 UTC when the triggering best block announce was received.
 	pub announce_utc: String,
@@ -23,7 +22,8 @@ pub struct FastPropFiredNotification {
 	/// EVM `to` when `fire_trigger` is `transactMatch`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub matched_call_address: Option<String>,
-	/// Milliseconds from the announce peer's best block announce to fire (actual; includes `offset_ms`).
+	/// Milliseconds from the announce peer's best block announce to fire trigger
+	/// (uses `fire_unix_ms - announce_unix_ms`; excludes post-trigger propagate/RPC stamp work).
 	pub latency_ms: i64,
 	pub event: &'static str,
 	/// Announce peer that triggered the fire.
@@ -81,6 +81,7 @@ pub fn publish_fast_prop_fired(
 	block_hash: &str,
 	extrinsic: &[u8],
 	fire_utc: &str,
+	fire_unix_ms: i64,
 	announce_utc: &str,
 	announce_unix_ms: i64,
 	offset_ms: u64,
@@ -90,8 +91,7 @@ pub fn publish_fast_prop_fired(
 	target_block_number: u64,
 	sent_count: usize,
 ) {
-	let fire_time = Utc::now();
-	let latency_ms = fire_time.timestamp_millis().saturating_sub(announce_unix_ms);
+	let latency_ms = fire_unix_ms.saturating_sub(announce_unix_ms);
 	let primary = propagate_peer_ids
 		.first()
 		.map(|s| s.as_str())

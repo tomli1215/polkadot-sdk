@@ -6,7 +6,7 @@
 //!
 //! When `SYNC_SUPPRESS_REANNOUNCE_BY_SLOT` maps index `(N - 1) % modulus` for landing `#N`,
 //! all modes are overridden: fire immediately on that producer's best announce at `#(N - 1)`
-//! (`offset_ms` is not applied; normal modes 0/1 still use `offset_ms`).
+//! without waiting for local import of `#(N - 1)` (`offset_ms` is not applied).
 
 use crate::fast_prop_pool::{
 	cancel_mode3_import_fallback, clear_pending_import, mode3_import_fallback_generation,
@@ -15,7 +15,7 @@ use crate::fast_prop_pool::{
 	take_pending_import_if_matches, take_pending_import_on_mixed_transact_match,
 	take_pool, take_pool_on_mode3_import_fallback,
 	take_pool_on_mixed_transact_match, try_authority_slot_announce_fire,
-	try_authority_slot_import_fire, try_open_transact_gate_on_announce, FastPropEntry,
+	try_open_transact_gate_on_announce, FastPropEntry,
 	FastPropFireMode,
 };
 use log::debug;
@@ -108,7 +108,7 @@ pub fn on_target_peer_block_announced(
 	announce_utc: String,
 	announce_unix_ms: i64,
 	local_have_block: bool,
-	local_best: u64,
+	_local_best: u64,
 ) {
 	record_announce_ready_pool_baseline(block_number);
 	if try_fire_authority_slot_override(
@@ -117,7 +117,6 @@ pub fn on_target_peer_block_announced(
 		&block_hash,
 		&announce_utc,
 		announce_unix_ms,
-		local_best,
 	) {
 		return;
 	}
@@ -184,16 +183,8 @@ fn try_fire_authority_slot_override(
 	block_hash: &str,
 	announce_utc: &str,
 	announce_unix_ms: i64,
-	local_best: u64,
 ) -> bool {
-	let Some(entry) = try_authority_slot_announce_fire(
-		peer,
-		block_number,
-		block_hash.to_string(),
-		announce_utc.to_string(),
-		announce_unix_ms,
-		local_best,
-	) else {
+	let Some(entry) = try_authority_slot_announce_fire(peer, block_number) else {
 		return false;
 	};
 	debug!(
@@ -215,38 +206,9 @@ fn try_fire_authority_slot_override(
 	true
 }
 
-fn try_fire_authority_slot_on_import(imported_block: u64, block_hash: &str) -> bool {
-	let Some((entry, announce_number, pending_hash, announce_utc, announce_unix_ms)) =
-		try_authority_slot_import_fire(imported_block)
-	else {
-		return false;
-	};
-	debug!(
-		target: crate::LOG_TARGET,
-		"fast prop: authority slot firing on import #{imported_block} after deferred announce #{announce_number} (target=#{})",
-		entry.target_block_number,
-	);
-	let ctx = FastPropBlockContext {
-		block_number: announce_number,
-		block_hash: normalize_hash(&pending_hash),
-		announce_utc: announce_utc.clone(),
-		announce_unix_ms,
-		executed_utc: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-		executed_unix_ms: chrono::Utc::now().timestamp_millis(),
-		trigger: FastPropFireTrigger::AuthoritySlotAnnounce,
-		matched_call_address: None,
-	};
-	let _ = block_hash;
-	schedule_fire(entry, ctx);
-	true
-}
-
 /// Local block import finished: fire in mode 1 when it matches pending pool peer announce.
 pub fn on_block_imported(block_number: u64, block_hash: &str) {
 	let hash_norm = normalize_hash(block_hash);
-	if try_fire_authority_slot_on_import(block_number, &hash_norm) {
-		return;
-	}
 	maybe_schedule_mode3_import_fallback(block_number, hash_norm.clone());
 
 	let Some((entry, _pending_number, _pending_hash, announce_utc, announce_unix_ms)) =
