@@ -5,7 +5,8 @@
 //! local import of `N-1` when no matching transact arrived).
 //!
 //! When `SYNC_SUPPRESS_REANNOUNCE_BY_SLOT` maps index `(N - 1) % modulus` for landing `#N`,
-//! all modes are overridden: fire on that producer's best announce at `#(N - 1)`.
+//! all modes are overridden: fire immediately on that producer's best announce at `#(N - 1)`
+//! (`offset_ms` is not applied; normal modes 0/1 still use `offset_ms`).
 
 use crate::fast_prop_pool::{
 	cancel_mode3_import_fallback, clear_pending_import, mode3_import_fallback_generation,
@@ -48,9 +49,9 @@ impl FastPropFireTrigger {
 		}
 	}
 
-	/// Transact match fires immediately; import fallback already waited `offset_ms`.
+	/// Transact match / import fallback fire immediately; authority slot fires on announce.
 	pub fn applies_offset_ms(self) -> bool {
-		matches!(self, Self::OnAnnounce | Self::BlockImport | Self::AuthoritySlotAnnounce)
+		matches!(self, Self::OnAnnounce | Self::BlockImport)
 	}
 }
 
