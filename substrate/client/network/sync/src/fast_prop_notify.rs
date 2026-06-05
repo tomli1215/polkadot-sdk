@@ -38,6 +38,9 @@ pub struct FastPropFiredNotification {
 	pub sent_count: usize,
 	#[serde(rename = "number")]
 	pub block_number: u64,
+	/// Armed pool landing block (`FastPropEntry::target_block_number`); absent when unset/zero.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub target_block_number: Option<u64>,
 	pub block_hash: String,
 	/// Hex-encoded extrinsic (`0x…`).
 	pub extrinsic: String,
@@ -84,6 +87,7 @@ pub fn publish_fast_prop_fired(
 	offset_applied_ms: u64,
 	fire_trigger: &str,
 	matched_call_address: Option<String>,
+	target_block_number: u64,
 	sent_count: usize,
 ) {
 	let fire_time = Utc::now();
@@ -108,6 +112,7 @@ pub fn publish_fast_prop_fired(
 		peer_id: primary.to_string(),
 		sent_count,
 		block_number,
+		target_block_number: (target_block_number > 0).then_some(target_block_number),
 		block_hash: block_hash.to_string(),
 		extrinsic: format!("0x{}", array_bytes::bytes2hex("", extrinsic)),
 		extrinsic_bytes: extrinsic.len(),
