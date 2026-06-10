@@ -20187,6 +20187,7 @@ dependencies = [
  "sc-utils",
  "schnellru",
  "serde",
+ "serde_json",
  "smallvec",
  "sp-arithmetic 27.0.0",
  "sp-blockchain",
