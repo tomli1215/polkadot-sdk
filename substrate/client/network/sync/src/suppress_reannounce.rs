@@ -66,12 +66,29 @@ fn state() -> &'static RwLock<SuppressState> {
 
 fn env_map_path() -> Option<PathBuf> {
 	let raw = std::env::var("SYNC_SUPPRESS_REANNOUNCE_MAP_PATH").ok()?;
+	path_from_trimmed(&raw)
+}
+
+fn path_from_trimmed(raw: &str) -> Option<PathBuf> {
 	let trimmed = raw.trim();
 	if trimmed.is_empty() {
 		None
 	} else {
 		Some(PathBuf::from(trimmed))
 	}
+}
+
+/// Override hot-reload JSON path (e.g. from `stake-sim.config.json` `paths.sync_suppress_reannounce`).
+pub fn set_map_path(path: Option<PathBuf>) {
+	let mut guard = state()
+		.write()
+		.unwrap_or_else(|e| e.into_inner());
+	if guard.map_path.as_ref() == path.as_ref() {
+		return;
+	}
+	guard.map_path = path;
+	guard.load_attempted = false;
+	guard.mtime = None;
 }
 
 fn parse_peer_token(token: &str) -> Option<PeerId> {
