@@ -10,15 +10,15 @@ use std::sync::{Arc, OnceLock, RwLock};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FastPropFireMode {
-	/// Fire `offset_ms` after the announce peer's best block announce (default).
+	/// Fire `offset_us` after the announce peer's best block announce (default).
 	#[default]
 	OnAnnounce = 0,
-	/// Fire `offset_ms` after this node finishes importing that block locally.
+	/// Fire `offset_us` after this node finishes importing that block locally.
 	OnBlockImport = 1,
 	/// Fire on matching incoming `Ethereum.transact` **or** after local block import (mode 1 path).
 	Mixed = 2,
 	/// Fire on matching incoming `Ethereum.transact` after the transact gate opens at the
-	/// first best announce for `targetBlockNumber - 1`, or `offset_ms` after local import of
+	/// first best announce for `targetBlockNumber - 1`, or `offset_us` after local import of
 	/// `N-1` if no matching transact arrived (import fallback).
 	TransactMatch = 3,
 }
@@ -59,9 +59,12 @@ pub struct FastPropEntry {
 		deserialize_with = "deserialize_propagate_peer_ids"
 	)]
 	pub propagate_peer_ids: Vec<String>,
-	/// Milliseconds to wait after the fire trigger (announce or import per `fire_mode`).
-	#[serde(default)]
-	pub offset_ms: u64,
+	/// Microseconds to wait after the fire trigger (announce or import per `fire_mode`).
+	#[serde(default, alias = "offsetMs", alias = "offset_us")]
+	pub offset_us: u64,
+	/// Delay after [`FastPropFireTrigger::AuthoritySlotAnnounce`] only (independent of `offset_us`).
+	#[serde(default, alias = "authoritySlotOffsetMs", alias = "authority_slot_offset_us")]
+	pub authority_slot_offset_us: u64,
 	/// Fire only on a best announce for this block number from `announce_peer_id` (`0` = next matching).
 	#[serde(default)]
 	pub target_block_number: u64,
@@ -90,7 +93,9 @@ pub struct FastPropPoolView {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub peer_id: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub offset_ms: Option<u64>,
+	pub offset_us: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub authority_slot_offset_us: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub target_block_number: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -155,7 +160,7 @@ fn mode3_parent_block_number(target: u64) -> Option<u64> {
 	}
 }
 
-/// Gate open + local import of `N-1` → start import-fallback timer (`offset_ms`, target `N`).
+/// Gate open + local import of `N-1` → start import-fallback timer (`offset_us`, target `N`).
 pub fn mode3_import_fallback_params(imported_number: u64) -> Option<(u64, u64)> {
 	let entry = pool().read().expect("fast prop pool lock").as_ref()?.clone();
 	if authority_slot_override_for_entry(&entry).is_some() {
@@ -172,7 +177,7 @@ pub fn mode3_import_fallback_params(imported_number: u64) -> Option<(u64, u64)> 
 	if imported_number != parent {
 		return None;
 	}
-	Some((entry.offset_ms, target))
+	Some((entry.offset_us, target))
 }
 
 /// Take the armed pool entry for mode-3 import fallback at fire time.
@@ -650,7 +655,8 @@ pub fn get_pool() -> FastPropPoolView {
 			propagate_peer_id: None,
 			propagate_peer_ids: None,
 			peer_id: None,
-			offset_ms: None,
+			offset_us: None,
+			authority_slot_offset_us: None,
 			target_block_number: None,
 			fire_mode: None,
 			watch_call_addresses: None,
@@ -675,7 +681,8 @@ pub fn get_pool() -> FastPropPoolView {
 				propagate_peer_id: Some(entry.primary_propagate_peer_id().to_string()),
 				propagate_peer_ids: Some(entry.propagate_peer_ids.clone()),
 				peer_id: Some(entry.announce_peer_id.clone()),
-				offset_ms: Some(entry.offset_ms),
+				offset_us: Some(entry.offset_us),
+				authority_slot_offset_us: Some(entry.authority_slot_offset_us),
 				target_block_number: Some(entry.target_block_number),
 				fire_mode: Some(entry.fire_mode),
 				watch_call_addresses: if entry.watch_call_addresses.is_empty() {

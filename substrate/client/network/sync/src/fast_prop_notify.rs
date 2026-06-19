@@ -13,10 +13,10 @@ pub struct FastPropFiredNotification {
 	pub utc: String,
 	/// RFC3339 UTC when the triggering best block announce was received.
 	pub announce_utc: String,
-	/// Configured delay from trigger to fire (`FastPropEntry::offset_ms`).
-	pub offset_ms: u64,
-	/// Delay actually applied for this fire (`0` for mode-2 `transactMatch`).
-	pub offset_applied_ms: u64,
+	/// Configured delay from trigger to fire (`offset_us` or `authority_slot_offset_us` per trigger).
+	pub offset_us: u64,
+	/// Delay actually applied for this fire (`0` when immediate).
+	pub offset_applied_us: u64,
 	/// What invoked the fire: `onAnnounce`, `blockImport`, `transactMatch`, `authoritySlotAnnounce`, etc.
 	pub fire_trigger: String,
 	/// EVM `to` when `fire_trigger` is `transactMatch`.
@@ -84,8 +84,8 @@ pub fn publish_fast_prop_fired(
 	fire_unix_ms: i64,
 	announce_utc: &str,
 	announce_unix_ms: i64,
-	offset_ms: u64,
-	offset_applied_ms: u64,
+	offset_us: u64,
+	offset_applied_us: u64,
 	fire_trigger: &str,
 	matched_call_address: Option<String>,
 	target_block_number: u64,
@@ -100,8 +100,8 @@ pub fn publish_fast_prop_fired(
 	let notification = FastPropFiredNotification {
 		utc: fire_utc.to_string(),
 		announce_utc: announce_utc.to_string(),
-		offset_ms,
-		offset_applied_ms,
+		offset_us,
+		offset_applied_us,
 		fire_trigger: fire_trigger.to_string(),
 		matched_call_address,
 		latency_ms,

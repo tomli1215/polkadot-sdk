@@ -1,12 +1,12 @@
-//! Fast propagation: fire pooled `(extrinsic, peer_id, offset_ms, fire_mode)` when the pool
+//! Fast propagation: fire pooled `(extrinsic, peer_id, offset_us, fire_mode)` when the pool
 //! trigger matches (mode 0: announce peer best announce; mode 1/2: any peer announce then
 //! local import; mode 2: or matching `Ethereum.transact` at target height; mode 3: transact match
-//! after the first best announce at `N-1` opens the gate, or import fallback `offset_ms` after
+//! after the first best announce at `N-1` opens the gate, or import fallback `offset_us` after
 //! local import of `N-1` when no matching transact arrived).
 //!
 //! When `SYNC_SUPPRESS_REANNOUNCE_BY_SLOT` maps index `(N - 1) % modulus` for landing `#N`,
-//! all modes are overridden: fire immediately on that producer's best announce at `#(N - 1)`
-//! without waiting for local import of `#(N - 1)` (`offset_ms` is not applied).
+//! all modes are overridden: fire on that producer's best announce at `#(N - 1)` without
+//! waiting for local import of `#(N - 1)` (`authority_slot_offset_us`, not `offset_us`).
 
 use crate::fast_prop_pool::{
 	cancel_mode3_import_fallback, clear_pending_import, mode3_import_fallback_generation,
@@ -32,7 +32,7 @@ pub enum FastPropFireTrigger {
 	BlockImport,
 	/// Mode 2: new `Ethereum.transact` with EVM `to` in `watch_call_addresses`.
 	TransactMatch,
-	/// Mode 3: no matching transact within `offset_ms` after local import of `N-1`.
+	/// Mode 3: no matching transact within `offset_us` after local import of `N-1`.
 	ImportFallback,
 	/// Authority slot override: best announce at `N-1` from the slot authority for target `N`.
 	AuthoritySlotAnnounce,
@@ -49,9 +49,14 @@ impl FastPropFireTrigger {
 		}
 	}
 
-	/// Transact match / import fallback fire immediately; authority slot fires on announce.
-	pub fn applies_offset_ms(self) -> bool {
-		matches!(self, Self::OnAnnounce | Self::BlockImport)
+	/// Pool-configured delay after this trigger (see [`FastPropEntry::offset_us`] and
+	/// [`FastPropEntry::authority_slot_offset_us`]).
+	pub fn configured_offset_us(self, entry: &FastPropEntry) -> u64 {
+		match self {
+			Self::AuthoritySlotAnnounce => entry.authority_slot_offset_us,
+			Self::OnAnnounce | Self::BlockImport => entry.offset_us,
+			_ => 0,
+		}
 	}
 }
 
@@ -307,7 +312,7 @@ pub fn on_mixed_mode_ethereum_transact(
 
 /// Mode 3: schedule import fallback on local import of `N-1` when the gate is already open.
 fn maybe_schedule_mode3_import_fallback(imported_number: u64, block_hash: String) {
-	let Some((offset_ms, target)) = mode3_import_fallback_params(imported_number) else {
+	let Some((offset_us, target)) = mode3_import_fallback_params(imported_number) else {
 		return;
 	};
 
@@ -316,12 +321,12 @@ fn maybe_schedule_mode3_import_fallback(imported_number: u64, block_hash: String
 
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop mode 3: scheduling import fallback in {offset_ms}ms after local import #{parent} (target=#{target})"
+		"fast prop mode 3: scheduling import fallback in {offset_us}µs after local import #{parent} (target=#{target})"
 	);
 
 	tokio::spawn(async move {
-		if offset_ms > 0 {
-			tokio::time::sleep(Duration::from_millis(offset_ms)).await;
+		if offset_us > 0 {
+			tokio::time::sleep(Duration::from_micros(offset_us)).await;
 		}
 		if !mode3_import_fallback_generation_active(generation) {
 			return;
@@ -334,7 +339,7 @@ fn maybe_schedule_mode3_import_fallback(imported_number: u64, block_hash: String
 		let executed_unix_ms = import_time.timestamp_millis();
 		debug!(
 			target: crate::LOG_TARGET,
-			"fast prop mode 3: import fallback firing for target #{target} (no matching transact within {offset_ms}ms of local import #{parent})"
+			"fast prop mode 3: import fallback firing for target #{target} (no matching transact within {offset_us}µs of local import #{parent})"
 		);
 		let ctx = FastPropBlockContext {
 			block_number: parent,
@@ -361,26 +366,22 @@ fn schedule_fire(entry: FastPropEntry, ctx: FastPropBlockContext) {
 		return;
 	};
 
-	let offset_ms = if ctx.trigger.applies_offset_ms() {
-		entry.offset_ms
-	} else {
-		0
-	};
+	let offset_us = ctx.trigger.configured_offset_us(&entry);
 
-	if offset_ms == 0 {
+	if offset_us == 0 {
 		handler(entry, ctx);
 		return;
 	}
 
 	debug!(
 		target: crate::LOG_TARGET,
-		"fast prop: scheduling fire {}ms after trigger ({}) for block #{}",
-		offset_ms,
+		"fast prop: scheduling fire {}µs after trigger ({}) for block #{}",
+		offset_us,
 		ctx.trigger.as_str(),
 		ctx.block_number,
 	);
 	tokio::spawn(async move {
-		tokio::time::sleep(Duration::from_millis(offset_ms)).await;
+		tokio::time::sleep(Duration::from_micros(offset_us)).await;
 		handler(entry, ctx);
 	});
 }
