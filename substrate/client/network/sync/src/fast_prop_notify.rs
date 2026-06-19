@@ -9,7 +9,7 @@ use std::sync::{OnceLock, RwLock};
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FastPropFiredNotification {
-	/// RFC3339 UTC when fast-prop fired (trigger time; may precede P2P propagate).
+	/// RFC3339 UTC when P2P propagation completed (after any configured offset sleep).
 	pub utc: String,
 	/// RFC3339 UTC when the triggering best block announce was received.
 	pub announce_utc: String,
@@ -22,8 +22,8 @@ pub struct FastPropFiredNotification {
 	/// EVM `to` when `fire_trigger` is `transactMatch`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub matched_call_address: Option<String>,
-	/// Milliseconds from the announce peer's best block announce to fire trigger
-	/// (uses `fire_unix_ms - announce_unix_ms`; excludes post-trigger propagate/RPC stamp work).
+	/// Milliseconds from announce receipt to post-propagate fire stamp
+	/// (`fire_unix_ms - announce_unix_ms`; includes offset sleep and propagate work).
 	pub latency_ms: i64,
 	pub event: &'static str,
 	/// Announce peer that triggered the fire.
