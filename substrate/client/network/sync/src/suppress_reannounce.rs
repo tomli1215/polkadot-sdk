@@ -44,6 +44,8 @@ struct SuppressState {
 	config: Config,
 	env_loaded: bool,
 	load_attempted: bool,
+	/// True while a background load owns I/O+parse (startup must not block on it).
+	loading: bool,
 }
 
 impl SuppressState {
@@ -54,6 +56,7 @@ impl SuppressState {
 			config: Config::default(),
 			env_loaded: false,
 			load_attempted: false,
+			loading: false,
 		}
 	}
 }
@@ -79,16 +82,53 @@ fn path_from_trimmed(raw: &str) -> Option<PathBuf> {
 }
 
 /// Override hot-reload JSON path (e.g. from `stake-sim.config.json` `paths.sync_suppress_reannounce`).
+///
+/// Kicks off a background warm so node startup does not stall on the JSON parse.
 pub fn set_map_path(path: Option<PathBuf>) {
-	let mut guard = state()
-		.write()
-		.unwrap_or_else(|e| e.into_inner());
-	if guard.map_path.as_ref() == path.as_ref() {
-		return;
+	{
+		let mut guard = state().write().unwrap_or_else(|e| e.into_inner());
+		if guard.map_path.as_ref() == path.as_ref() {
+			return;
+		}
+		guard.map_path = path;
+		guard.load_attempted = false;
+		guard.mtime = None;
+		guard.loading = false;
 	}
-	guard.map_path = path;
-	guard.load_attempted = false;
-	guard.mtime = None;
+	warm_in_background();
+}
+
+/// Read + parse the suppress-reannounce JSON on a detached thread.
+pub fn warm_in_background() {
+	let path = {
+		let mut guard = state().write().unwrap_or_else(|e| e.into_inner());
+		// Prefer configured path; fall back to env if STATE was created before env was set.
+		if guard.map_path.is_none() {
+			guard.map_path = env_map_path();
+		}
+		let Some(path) = guard.map_path.clone() else {
+			return;
+		};
+		if guard.loading {
+			return;
+		}
+		guard.loading = true;
+		path
+	};
+
+	if let Err(e) = std::thread::Builder::new()
+		.name("suppress-reannounce-load".into())
+		.spawn(move || {
+			load_path_into_state(&path, /*background*/ true);
+		})
+	{
+		log::warn!(
+			target: LOG_TARGET,
+			"suppress reannounce background load spawn failed: {e}",
+		);
+		let mut guard = state().write().unwrap_or_else(|e| e.into_inner());
+		guard.loading = false;
+	}
 }
 
 fn parse_peer_token(token: &str) -> Option<PeerId> {
@@ -191,39 +231,79 @@ fn load_config_from_file(path: &Path) -> Option<Config> {
 	Some(Config { modulus, by_slot })
 }
 
-fn reload_if_stale(state: &mut SuppressState) {
-	if let Some(path) = state.map_path.clone() {
-		let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-		if !state.load_attempted || mtime != state.mtime {
-			state.load_attempted = true;
-			state.mtime = mtime;
-			if let Some(cfg) = load_config_from_file(&path) {
-				log_config_loaded(&format!("file {}", path.display()), &cfg);
-				state.config = cfg;
-				return;
-			}
-			if !state.env_loaded {
-				state.config = load_config_from_env();
-				state.env_loaded = true;
-				log_config_loaded("env fallback", &state.config);
-			}
-		}
+fn load_path_into_state(path: &Path, _background: bool) {
+	let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+	let file_cfg = load_config_from_file(path);
+
+	let mut guard = state().write().unwrap_or_else(|e| e.into_inner());
+	if guard.map_path.as_deref() != Some(path) {
+		// Path changed while we were loading — a newer warm owns `loading`.
 		return;
 	}
 
-	if !state.env_loaded {
-		state.config = load_config_from_env();
-		state.env_loaded = true;
-		log_config_loaded("env", &state.config);
+	guard.load_attempted = true;
+	guard.mtime = mtime;
+	if let Some(cfg) = file_cfg {
+		log_config_loaded(&format!("file {}", path.display()), &cfg);
+		guard.config = cfg;
+	} else if !guard.env_loaded {
+		guard.config = load_config_from_env();
+		guard.env_loaded = true;
+		log_config_loaded("env fallback", &guard.config);
 	}
+	guard.loading = false;
 }
 
 fn active_config() -> Config {
-	let mut guard = state()
-		.write()
-		.unwrap_or_else(|e| e.into_inner());
-	reload_if_stale(&mut guard);
-	guard.config.clone()
+	let path_to_load = {
+		let guard = state().read().unwrap_or_else(|e| e.into_inner());
+		if guard.loading {
+			return guard.config.clone();
+		}
+		match guard.map_path.as_ref() {
+			Some(path) => {
+				let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+				if guard.load_attempted && mtime == guard.mtime {
+					return guard.config.clone();
+				}
+				Some(path.clone())
+			},
+			None => {
+				if guard.env_loaded {
+					return guard.config.clone();
+				}
+				None
+			},
+		}
+	};
+
+	if let Some(path) = path_to_load {
+		{
+			let mut guard = state().write().unwrap_or_else(|e| e.into_inner());
+			if guard.loading {
+				return guard.config.clone();
+			}
+			let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+			if guard.map_path.as_ref() == Some(&path) &&
+				guard.load_attempted &&
+				mtime == guard.mtime
+			{
+				return guard.config.clone();
+			}
+			guard.loading = true;
+		}
+		load_path_into_state(&path, /*background*/ false);
+	} else {
+		let mut guard = state().write().unwrap_or_else(|e| e.into_inner());
+		if !guard.env_loaded {
+			guard.config = load_config_from_env();
+			guard.env_loaded = true;
+			log_config_loaded("env", &guard.config);
+		}
+		return guard.config.clone();
+	}
+
+	state().read().unwrap_or_else(|e| e.into_inner()).config.clone()
 }
 
 fn authority_peer_for_slot_index(cfg: &Config, slot: u64) -> Option<PeerId> {
